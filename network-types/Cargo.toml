@@ -1,0 +1,8 @@
+[package]
+name = "network_types"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+postcard = {version = "1.1.3", features=["use-std"]}
+serde = "1.0.228"
