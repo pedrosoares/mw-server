@@ -318,8 +318,8 @@ fn set_client_match_id(id: i32, match_id: i32, clients: &Arc<RwLock<Vec<Client>>
 }
 
 fn main() -> std::io::Result<()> {
-    let listener = TcpListener::bind("127.0.0.1:7878")?;
-    println!("Server listening on 127.0.0.1:7878");
+    let listener = TcpListener::bind("0.0.0.0:7878")?;
+    println!("Server listening on 0.0.0.0:7878");
 
     let mut client_id_serial: i32 = 0;
     // TODO Remove Disconnected Clients
@@ -570,7 +570,7 @@ fn main() -> std::io::Result<()> {
     });
 
     let udp_is_running = Arc::new(AtomicBool::new(true));
-    let udp_main_loop = udp::server("127.0.0.1:7879".to_owned(), udp_is_running.clone()).unwrap();
+    let udp_main_loop = udp::server("0.0.0.0:7879".to_owned(), udp_is_running.clone()).unwrap();
 
     for stream in listener.incoming() {
         match stream {
