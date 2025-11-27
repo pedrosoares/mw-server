@@ -136,7 +136,7 @@ impl Client {
                         };
                     }
                     ClientState::MatchClient => {
-                        match Packet::from(&buffer[..data]) {
+                        match packet {
                             Packet::LeaveMatch { room_id } => {
                                 tx.send(Message::LeaveMatch { id, room_id }).unwrap();
                                 state = ClientState::Menu;
@@ -161,7 +161,7 @@ impl Client {
                         Self::send_message(id, &clients, &buffer[..data]);
                     }
                     ClientState::MatchHost => {
-                        match Packet::from(&buffer[..data]) {
+                        match packet {
                             Packet::StartMatch { room_id, map } => {
                                 // TODO Start Match
                                 tx.send(Message::StartMatch { id, room_id, map }).unwrap();
@@ -221,19 +221,6 @@ impl Client {
                                     Self::send_message_to(id, &clients, &buffer[..data]);
                                     continue;
                                 }
-                                // Self::send_message(
-                                //     id,
-                                //     &clients,
-                                //     Packet::RemoteObjectCall {
-                                //         id,
-                                //         object_id,
-                                //         method,
-                                //         params,
-                                //         broadcast,
-                                //     }
-                                //     .serialize()
-                                //     .as_slice(),
-                                // );
                             }
                             _ => {}
                         };
