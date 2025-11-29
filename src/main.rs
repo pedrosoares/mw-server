@@ -81,7 +81,12 @@ impl Client {
         }
     }
 
-    pub fn start(mut self, tx: Sender<Message>, clients: Arc<RwLock<Vec<Client>>>) -> Self {
+    pub fn start(
+        mut self,
+        tx: Sender<Message>,
+        clients: Arc<RwLock<Vec<Client>>>,
+        // match_list: RwLockReadGuard<Vec<Match>>,
+    ) -> Self {
         let id = self.id.clone();
         let running = self.running.clone();
         let mut stream = self.stream.try_clone().unwrap();
@@ -248,12 +253,13 @@ impl Client {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Match {
     id: i32,
     owner_id: i32,
     name: String,
     clients: Vec<i32>,
+    clients_sockets: Vec<TcpStream>,
     started: bool,
 }
 
@@ -272,11 +278,11 @@ pub enum Message {
 
 fn notify_all_match_list(
     clients_on_match_list: &Vec<i32>,
-    match_list: &Vec<Match>,
+    match_list: RwLockReadGuard<Vec<Match>>,
     clients: RwLockReadGuard<Vec<Client>>,
 ) {
     if clients_on_match_list.len() > 0 {
-        let match_list = Packet::MatchList {
+        let match_list_packet = Packet::MatchList {
             matches: match_list
                 .iter()
                 .map(|m| (m.id, m.name.clone(), m.clients.len() as i32))
@@ -290,7 +296,7 @@ fn notify_all_match_list(
                         .stream
                         .try_clone()
                         .unwrap()
-                        .write(match_list.serialize().as_slice())
+                        .write(match_list_packet.serialize().as_slice())
                         .unwrap();
                 }
             });
@@ -334,7 +340,7 @@ fn main() -> std::io::Result<()> {
 
                         notify_all_match_list(
                             &vec![id],
-                            &matches.read().unwrap().clone(),
+                            matches.read().unwrap(),
                             main_loop_clients.read().unwrap(),
                         );
                     }
@@ -347,39 +353,36 @@ fn main() -> std::io::Result<()> {
                         {
                             let mut m = matches.write().unwrap();
 
+                            let owner = clients.iter().find(|client| client.id == id).unwrap();
+                            let mut owner_stream = owner.stream.try_clone().unwrap();
+
+                            // Notify owner that the Match was created
+                            owner_stream
+                                .write(
+                                    Packet::MatchCreated {
+                                        id: match_id,
+                                        owner_id: id,
+                                        room_name: room_name.clone(),
+                                    }
+                                    .serialize()
+                                    .as_slice(),
+                                )
+                                .unwrap();
+
                             m.push(Match {
                                 id: match_id,
                                 owner_id: id.clone(),
                                 name: room_name.clone(),
                                 clients: vec![id.clone()],
+                                clients_sockets: vec![owner_stream],
                                 started: false,
                             });
-
-                            // Notify owner that the Match was created
-                            clients.iter().for_each(|client| {
-                                if client.id == id {
-                                    client
-                                        .stream
-                                        .try_clone()
-                                        .unwrap()
-                                        .write(
-                                            Packet::MatchCreated {
-                                                id: match_id,
-                                                owner_id: id,
-                                                room_name: room_name.clone(),
-                                            }
-                                            .serialize()
-                                            .as_slice(),
-                                        )
-                                        .unwrap();
-                                }
-                            })
                         }
 
                         // Notify all clients on Match List about this new Match
                         notify_all_match_list(
                             &clients_on_match_list,
-                            &matches.read().unwrap().clone(),
+                            matches.read().unwrap(),
                             clients,
                         );
 
@@ -413,6 +416,10 @@ fn main() -> std::io::Result<()> {
                                         client.stream.try_clone().unwrap(),
                                     )
                                 };
+
+                                // Add client to socket
+                                m.clients_sockets
+                                    .push(joined_client_stream.try_clone().unwrap());
 
                                 for client_id in m.clients.iter() {
                                     // Notify client that he joined successfully
@@ -483,32 +490,49 @@ fn main() -> std::io::Result<()> {
                         });
                         notify_all_match_list(
                             &clients_on_match_list,
-                            &matches.read().unwrap().clone(),
+                            matches.read().unwrap(),
                             clients,
                         );
                         set_client_match_id(id, -1, &main_loop_clients);
                     }
                     Message::LeaveMatch { id, room_id } => {
-                        let clients = main_loop_clients.read().unwrap();
                         matches.write().unwrap().iter_mut().for_each(|m| {
                             if m.id == room_id {
+                                let (name, client_peer_addr) = {
+                                    let clients = main_loop_clients.read().unwrap();
+                                    let c = clients.iter().find(|client| client.id == id).unwrap();
+                                    (c.name.clone(), c.stream.peer_addr().unwrap())
+                                };
                                 // Removes Client from Room
                                 m.clients.retain(|client| *client != id);
+                                m.clients_sockets
+                                    .retain(|s| s.peer_addr().unwrap() != client_peer_addr);
+
                                 // Tell Everybody
-                                clients.iter().for_each(|client| {
-                                    m.clients.iter().for_each(|id| {
-                                        if *id == client.id {
-                                            let _ = client.stream.try_clone().unwrap().write(
-                                                Packet::MatchLeaved {
-                                                    user_id: client.id,
-                                                    user_name: client.name.clone(),
-                                                }
-                                                .serialize()
-                                                .as_slice(),
-                                            );
+                                m.clients_sockets.iter_mut().for_each(|stream| {
+                                    let _ = stream.write(
+                                        Packet::MatchLeaved {
+                                            user_id: id,
+                                            user_name: name.clone(),
                                         }
-                                    });
+                                        .serialize()
+                                        .as_slice(),
+                                    );
                                 });
+                                // clients.iter().for_each(|client| {
+                                //     m.clients.iter().for_each(|id| {
+                                //         if *id == client.id {
+                                //             let _ = client.stream.try_clone().unwrap().write(
+                                //                 Packet::MatchLeaved {
+                                //                     user_id: client.id,
+                                //                     user_name: client.name.clone(),
+                                //                 }
+                                //                 .serialize()
+                                //                 .as_slice(),
+                                //             );
+                                //         }
+                                //     });
+                                // });
                             }
                         });
                         set_client_match_id(id, -1, &main_loop_clients);
@@ -537,13 +561,10 @@ fn main() -> std::io::Result<()> {
                             let room = matches.iter_mut().find(|m| m.id == room_id).unwrap();
                             room.started = true;
                         }
-
-                        let match_list: Vec<Match> = matches.read().unwrap().clone();
-
                         // Notify all clients on Match List about this new Match
                         notify_all_match_list(
                             &clients_on_match_list,
-                            &match_list,
+                            matches.read().unwrap(),
                             main_loop_clients.read().unwrap(),
                         );
                         // TODO Check it latter
