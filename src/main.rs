@@ -160,6 +160,12 @@ impl Client {
                                 }
                                 println!("calling send_all");
                             }
+                            Packet::DespawnRemoteObject { id, object_id } => {
+                                println!(
+                                    "Packet::DespawnRemoteObject {{ id: {}, object_id: {} }}",
+                                    id, object_id
+                                );
+                            }
                             _ => {}
                         };
                         // TODO Change this to only players in the same match
@@ -226,6 +232,12 @@ impl Client {
                                     Self::send_message_to(id, &clients, &buffer[..data]);
                                     continue;
                                 }
+                            }
+                            Packet::DespawnRemoteObject { id, object_id } => {
+                                println!(
+                                    "Packet::DespawnRemoteObject {{ id: {}, object_id: {} }}",
+                                    id, object_id
+                                );
                             }
                             _ => {}
                         };
