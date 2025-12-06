@@ -53,7 +53,14 @@ impl Client {
             .stream
             .try_clone()
             .unwrap();
-        match stream.write(message) {
+
+        let len = message.len() as u32;
+        let mut buf = Vec::with_capacity(4 + message.len());
+
+        buf.extend_from_slice(&len.to_be_bytes());
+        buf.extend_from_slice(message);
+
+        match stream.write(&buf[..]) {
             Ok(_) => {
                 println!("Sended Message to {}", id);
             }
@@ -73,8 +80,15 @@ impl Client {
                 .map(|c| (c.name.clone(), c.stream.try_clone().unwrap()))
                 .collect::<Vec<_>>()
         };
+
+        let len = message.len() as u32;
+        let mut buf = Vec::with_capacity(4 + message.len());
+
+        buf.extend_from_slice(&len.to_be_bytes());
+        buf.extend_from_slice(message);
+
         for (name, c) in clients_snapshot.iter_mut() {
-            match c.write(message) {
+            match c.write(&buf[..]) {
                 Ok(_) => {}
                 Err(err) => println!("Client ({}) not available: {:?}", name, err),
             }
@@ -94,10 +108,8 @@ impl Client {
             let peer_addr = stream.peer_addr().unwrap();
             let mut state = ClientState::Menu;
             while running.load(Ordering::Relaxed) {
-                let mut buffer = [0u8; 2048 * 4];
-
-                let data = {
-                    match stream.read(&mut buffer) {
+                let buffer = {
+                    match helpers::read_message(&mut stream) {
                         Ok(b) => b,
                         Err(_) => {
                             tx.send(Message::Disconnected { id }).unwrap();
@@ -107,9 +119,9 @@ impl Client {
                     }
                 };
 
-                let packet = Packet::from(buffer.clone().as_slice());
+                let packet = Packet::from(buffer.as_slice());
 
-                // println!("Packet({}={:?}={}) {:?}", id, state, peer_addr, packet);
+                println!("Packet({}={:?}={}) {:?}", id, state, peer_addr, packet);
 
                 match state {
                     ClientState::Menu => {
@@ -121,7 +133,11 @@ impl Client {
                                     }
                                 });
                                 stream
-                                    .write_all(Packet::Login { id, name }.serialize().as_slice())
+                                    .write_all(
+                                        Packet::Login { id, name }
+                                            .serialize_with_header()
+                                            .as_slice(),
+                                    )
                                     .unwrap();
                             }
                             Packet::RemoveFromListMatches => {
@@ -155,7 +171,7 @@ impl Client {
                                 broadcast,
                             } => {
                                 if !broadcast {
-                                    Self::send_message_to(id, &clients, &buffer[..data]);
+                                    Self::send_message_to(id, &clients, buffer.as_slice());
                                     continue;
                                 }
                                 println!("calling send_all");
@@ -169,7 +185,7 @@ impl Client {
                             _ => {}
                         };
                         // TODO Change this to only players in the same match
-                        Self::send_message(id, &clients, &buffer[..data]);
+                        Self::send_message(id, &clients, buffer.as_slice());
                     }
                     ClientState::MatchHost => {
                         match packet {
@@ -203,7 +219,8 @@ impl Client {
 
                                     println!("Spawn {:?} for {}", spawn, name);
 
-                                    let message = Packet::Spawn { position: spawn }.serialize();
+                                    let message =
+                                        Packet::Spawn { position: spawn }.serialize_with_header();
                                     match stream.write(message.as_slice()) {
                                         Ok(_) => {
                                             index = index + 1;
@@ -229,7 +246,7 @@ impl Client {
                                 broadcast,
                             } => {
                                 if !broadcast {
-                                    Self::send_message_to(id, &clients, &buffer[..data]);
+                                    Self::send_message_to(id, &clients, buffer.as_slice());
                                     continue;
                                 }
                             }
@@ -239,13 +256,15 @@ impl Client {
                                     id, object_id
                                 );
                             }
-                            _ => {}
+                            packet => {
+                                println!("Ingored Packaet {:?}", packet);
+                            }
                         };
                         // TODO Change this to only players in the same match
-                        Self::send_message(id, &clients, &buffer[..data]);
+                        Self::send_message(id, &clients, buffer.as_slice());
                     }
                     ClientState::InGame => {
-                        Self::send_message(id, &clients, &buffer[..data]);
+                        Self::send_message(id, &clients, buffer.as_slice());
                     }
                 }
             }
@@ -308,7 +327,7 @@ fn notify_all_match_list(
                         .stream
                         .try_clone()
                         .unwrap()
-                        .write(match_list_packet.serialize().as_slice())
+                        .write(match_list_packet.serialize_with_header().as_slice())
                         .unwrap();
                 }
             });
@@ -376,7 +395,7 @@ fn main() -> std::io::Result<()> {
                                         owner_id: id,
                                         room_name: room_name.clone(),
                                     }
-                                    .serialize()
+                                    .serialize_with_header()
                                     .as_slice(),
                                 )
                                 .unwrap();
@@ -451,7 +470,7 @@ fn main() -> std::io::Result<()> {
                                                 user_name: client.name.clone(),
                                                 room_name: m.name.clone(),
                                             }
-                                            .serialize()
+                                            .serialize_with_header()
                                             .as_slice(),
                                         )
                                         .unwrap();
@@ -469,7 +488,7 @@ fn main() -> std::io::Result<()> {
                                                     user_name: joined_client_name.clone(),
                                                     room_name: m.name.clone(),
                                                 }
-                                                .serialize()
+                                                .serialize_with_header()
                                                 .as_slice(),
                                             )
                                             .unwrap();
@@ -491,7 +510,11 @@ fn main() -> std::io::Result<()> {
                                                 .stream
                                                 .try_clone()
                                                 .unwrap()
-                                                .write(Packet::MatchDeleted.serialize().as_slice())
+                                                .write(
+                                                    Packet::MatchDeleted
+                                                        .serialize_with_header()
+                                                        .as_slice(),
+                                                )
                                                 .unwrap();
                                         }
                                     });
@@ -527,7 +550,7 @@ fn main() -> std::io::Result<()> {
                                             user_id: id,
                                             user_name: name.clone(),
                                         }
-                                        .serialize()
+                                        .serialize_with_header()
                                         .as_slice(),
                                     );
                                 });
@@ -539,7 +562,7 @@ fn main() -> std::io::Result<()> {
                                 //                     user_id: client.id,
                                 //                     user_name: client.name.clone(),
                                 //                 }
-                                //                 .serialize()
+                                //                 .serialize_with_header()
                                 //                 .as_slice(),
                                 //             );
                                 //         }

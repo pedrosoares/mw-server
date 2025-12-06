@@ -97,6 +97,18 @@ impl Packet {
     pub fn serialize(&self) -> Vec<u8> {
         postcard::to_stdvec(self).unwrap()
     }
+
+    pub fn serialize_with_header(&self) -> Vec<u8> {
+        let message = postcard::to_stdvec(self).unwrap();
+
+        let len = message.len() as u32;
+        let mut buf = Vec::with_capacity(4 + message.len());
+
+        buf.extend_from_slice(&len.to_be_bytes());
+        buf.extend_from_slice(&message[..]);
+
+        return buf;
+    }
 }
 
 // TODO do it latter
