@@ -1,0 +1,24 @@
+[package]
+name = "mw_server"
+description = "Lobby + relay server for Godot multiplayer games (TCP for state, UDP for voice)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+# Kept as `network_manager` so existing deploy scripts / CI artifacts keep working.
+name = "network_manager"
+path = "src/main.rs"
+
+[dependencies]
+mw_protocol.workspace = true
+bytes.workspace = true
+tokio.workspace = true
+socket2.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+getrandom.workspace = true
