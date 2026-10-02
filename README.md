@@ -5,8 +5,13 @@ template:
 
 - **TCP** (`:7878`): login, rooms (matches), and relay of replication packets
   (`RemoteObject*`, `Spawn`, chat) inside a room.
-- **UDP** (`:7879`): order-preserving relay of voice or other unreliable
-  datagrams between room members, authenticated with a per-session token.
+- **UDP** (`:7879`): order-preserving relay of voice, positions, and other
+  unreliable datagrams between room members. Peers authenticate with a
+  per-session token, and the server stamps each datagram with its sender's id.
+- **Rate limits**: TCP floods are throttled (no data lost), and excess UDP is
+  dropped.
+- **Godot client** in [`godot/addons/mw_client`](godot/addons/mw_client),
+  tested against this server in CI.
 - **`RoomLogic`**: plug in server-side game rules (scores, timers, validation)
   without touching the networking.
 
@@ -36,20 +41,29 @@ Every flag also reads an env var:
 | `--keepalive-secs` | `MW_KEEPALIVE_SECS` | `15` | TCP keepalive, detects dead peers. |
 | `--legacy-udp-join` | `MW_LEGACY_UDP_JOIN` | off | Accept the unauthenticated v1 UDP join. |
 | `--udp-peer-timeout-secs` | `MW_UDP_PEER_TIMEOUT_SECS` | `30` | Forget silent legacy UDP peers. |
+| `--max-msgs-per-sec` | `MW_MAX_MSGS_PER_SEC` | `1000` | TCP frames per client per second; over that, the client is throttled. |
+| `--max-bytes-per-sec` | `MW_MAX_BYTES_PER_SEC` | `1048576` | TCP bytes per client per second, throttled the same way. |
+| `--udp-max-packets-per-sec` | `MW_UDP_MAX_PACKETS_PER_SEC` | `500` | Excess datagrams are dropped. |
+| `--udp-max-bytes-per-sec` | `MW_UDP_MAX_BYTES_PER_SEC` | `524288` | Excess datagrams are dropped. |
 | `--tick-rate` | `MW_TICK_RATE` | `0` | `RoomLogic::on_tick` calls per second. |
 
 ## Layout
 
 ```
-crates/protocol   mw_protocol: Packet enum, framing, tags (shared with Rust clients)
+crates/protocol   mw_protocol: Packet enum, framing, tags, udp:: datagram helpers
 crates/server     mw_server: library + `network_manager` binary
   src/config.rs   CLI / env configuration
   src/tcp.rs      accept loop; per-connection reader + writer tasks
   src/hub.rs      lobby: sessions, rooms, routing (single task, no locks)
   src/udp.rs      UDP relay (single task, membership pushed by the hub)
   src/logic.rs    RoomLogic trait, RoomCtx, Route
+  src/rate.rs     token buckets for TCP throttling / UDP dropping
   examples/       scoreboard.rs: a RoomLogic template
   tests/          end-to-end tests against a real server
+godot/
+  addons/mw_client/protocol.gd   GDScript codec for every packet + UDP envelope
+  addons/mw_client/client.gd     MwClient node (lobby, UDP join, positions, voice)
+  tests/run.gd                   headless tests (golden bytes + live server)
 ```
 
 ### How it works
@@ -70,6 +84,22 @@ client ◄───│ batches + flushes     │◄─────────�
 - Sends never block the hub. A client that can't keep up fills its queue and
   is dropped.
 - `TCP_NODELAY` and keepalive are set on every connection.
+
+## Godot client
+
+Copy `godot/addons/mw_client` into your project:
+
+```gdscript
+var net := MwClient.new()
+add_child(net)
+net.connect_to_server("127.0.0.1")
+await net.connected
+net.login("alice")
+net.create_match("my room")   # or net.join_match(id) after net.list_matches()
+net.location_received.connect(func(sender, object_id, pos, rot): ...)
+# every physics frame:
+net.send_location(object_id, global_position, rotation)   # UDP, newest wins
+```
 
 ## Adding game logic
 
@@ -101,9 +131,10 @@ run on the hub task, so keep them short. Send heavy work to another task.
 cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+GODOT=/path/to/godot godot/run_tests.sh     # GDScript client vs. live server
 ```
 
-CI runs the same three commands, then builds release binaries for Linux and
+CI runs all four, then builds release binaries for Linux and
 Windows.
 
 ## Benchmark

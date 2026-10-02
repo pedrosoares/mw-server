@@ -4,8 +4,9 @@
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpStream, UdpSocket};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use mw_server::protocol::udp::{self as udp_proto, LatestWins, Relayed};
 use mw_server::protocol::{
     DEFAULT_MAX_FRAME_LEN, ErrorCode, FrameError, PROTOCOL_VERSION, Packet, read_frame,
     write_packet,
@@ -480,9 +481,43 @@ fn udp_voice_is_authenticated_and_scoped_to_the_room() {
     );
     expect_acks(&guest_udp);
 
-    host_udp.send_to(b"voice-frame", server.udp).unwrap();
-    assert_eq!(udp_recv(&guest_udp), b"voice-frame");
+    // v2 receivers get the datagram prefixed with the sender's id.
+    let voice = udp_proto::encode_voice(b"voice-frame");
+    host_udp.send_to(&voice, server.udp).unwrap();
+    let received = udp_recv(&guest_udp);
+    let relayed = Relayed::parse(&received).unwrap();
+    assert_eq!(relayed.sender, host.id);
+    assert_eq!(relayed.channel, udp_proto::CHANNEL_VOICE);
+    assert_eq!(relayed.payload, b"voice-frame");
     udp_assert_silent(&host_udp);
+
+    // Positions over UDP: newest sequence wins on the receiver.
+    let mut latest = LatestWins::default();
+    for sequence in [5, 3, 6] {
+        let location = Packet::RemoteObjectLocation {
+            id: host.id,
+            object_id: 1,
+            position: (sequence as f32, 0.0, 0.0),
+            rotation: (0.0, 0.0, 0.0),
+        };
+        host_udp
+            .send_to(&udp_proto::encode_state(sequence, &location), server.udp)
+            .unwrap();
+    }
+    let mut applied = Vec::new();
+    for _ in 0..3 {
+        let received = udp_recv(&guest_udp);
+        let relayed = Relayed::parse(&received).unwrap();
+        assert_eq!(relayed.channel, udp_proto::CHANNEL_STATE);
+        let (sequence, packet) = udp_proto::decode_state(relayed.payload).unwrap();
+        let Packet::RemoteObjectLocation { object_id, .. } = packet else {
+            panic!("expected a location, got {packet:?}");
+        };
+        if latest.accept(relayed.sender, object_id, sequence) {
+            applied.push(sequence);
+        }
+    }
+    assert_eq!(applied, [5, 6]);
 
     // Wrong token and the legacy join are rejected by default.
     let intruder = udp_join(&server, &Packet::UdpJoin { token: 12345 });
@@ -512,6 +547,95 @@ fn legacy_udp_join_can_be_enabled() {
     a.send_to(b"hello", server.udp).unwrap();
     assert_eq!(udp_recv(&b), b"hello");
     udp_assert_silent(&other_room);
+}
+
+#[test]
+fn mixed_room_stamps_only_for_v2_receivers() {
+    let server = start(|config| config.legacy_udp_join = true);
+    let mut host = Client::modern(&server, "host");
+    let room = host.create_room("r");
+    let host_udp = udp_join(
+        &server,
+        &Packet::UdpJoin {
+            token: host.udp_token,
+        },
+    );
+    expect_acks(&host_udp);
+    let legacy_udp = udp_join(&server, &Packet::JoinMatch { room_id: room });
+    expect_acks(&legacy_udp);
+
+    host_udp.send_to(b"\0from-v2", server.udp).unwrap();
+    assert_eq!(udp_recv(&legacy_udp), b"\0from-v2");
+
+    legacy_udp.send_to(b"\0from-v1", server.udp).unwrap();
+    let received = udp_recv(&host_udp);
+    let relayed = Relayed::parse(&received).unwrap();
+    assert_eq!(relayed.sender, udp_proto::UNKNOWN_SENDER);
+    assert_eq!(relayed.payload, b"from-v1");
+}
+
+#[test]
+fn udp_excess_is_dropped() {
+    let server = start(|config| config.udp_max_packets_per_sec = 5);
+    let mut host = Client::modern(&server, "host");
+    let room = host.create_room("r");
+    let mut guest = Client::modern(&server, "guest");
+    guest.join_room(room, 1);
+    let host_udp = udp_join(
+        &server,
+        &Packet::UdpJoin {
+            token: host.udp_token,
+        },
+    );
+    expect_acks(&host_udp);
+    let guest_udp = udp_join(
+        &server,
+        &Packet::UdpJoin {
+            token: guest.udp_token,
+        },
+    );
+    expect_acks(&guest_udp);
+
+    for _ in 0..50 {
+        host_udp.send_to(b"\0x", server.udp).unwrap();
+    }
+    guest_udp.set_read_timeout(Some(SILENCE)).unwrap();
+    let mut buf = [0u8; 64];
+    let mut received = 0;
+    while guest_udp.recv(&mut buf).is_ok() {
+        received += 1;
+    }
+    assert!((5..=7).contains(&received), "received {received}");
+}
+
+#[test]
+fn tcp_flood_is_throttled_without_loss() {
+    let server = start(|config| config.max_msgs_per_sec = 20);
+    let mut host = Client::legacy(&server, "host");
+    let room = host.create_room("r");
+    let mut guest = Client::legacy(&server, "guest");
+    guest.join_room(room, 1);
+    host.recv(); // MatchJoined(guest)
+
+    // Login/create/join already used a few tokens; the rest of the first
+    // second's budget goes through at once, then 20 per second.
+    let started = Instant::now();
+    for object_id in 0..60 {
+        host.send(&Packet::RemoteObjectLocation {
+            id: host.id,
+            object_id,
+            position: (0.0, 0.0, 0.0),
+            rotation: (0.0, 0.0, 0.0),
+        });
+    }
+    for object_id in 0..60 {
+        assert!(matches!(
+            guest.recv(),
+            Packet::RemoteObjectLocation { object_id: got, .. } if got == object_id
+        ));
+    }
+    let elapsed = started.elapsed();
+    assert!(elapsed >= Duration::from_millis(1800), "took {elapsed:?}");
 }
 
 /// Server-authoritative example: kind 1 is answered by the server, kind 5 goes

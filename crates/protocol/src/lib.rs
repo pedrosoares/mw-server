@@ -16,6 +16,8 @@
 //!
 //! See `PROTOCOL.md` at the repository root for the full flow.
 
+pub mod udp;
+
 use std::fmt;
 use std::io::{self, Read, Write};
 

@@ -22,6 +22,7 @@ mod config;
 mod hub;
 mod ids;
 mod logic;
+mod rate;
 mod tcp;
 mod udp;
 

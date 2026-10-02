@@ -55,6 +55,23 @@ pub struct Config {
     #[arg(long, env = "MW_UDP_PEER_TIMEOUT_SECS", default_value_t = 30)]
     pub udp_peer_timeout_secs: u64,
 
+    /// TCP frames a client may send per second (0 = unlimited). Faster clients
+    /// are throttled: the server stops reading their socket for a while.
+    #[arg(long, env = "MW_MAX_MSGS_PER_SEC", default_value_t = 1000)]
+    pub max_msgs_per_sec: u32,
+
+    /// TCP bytes a client may send per second (0 = unlimited), throttled likewise.
+    #[arg(long, env = "MW_MAX_BYTES_PER_SEC", default_value_t = 1024 * 1024)]
+    pub max_bytes_per_sec: u32,
+
+    /// UDP datagrams a peer may send per second (0 = unlimited); excess is dropped.
+    #[arg(long, env = "MW_UDP_MAX_PACKETS_PER_SEC", default_value_t = 500)]
+    pub udp_max_packets_per_sec: u32,
+
+    /// UDP bytes a peer may send per second (0 = unlimited); excess is dropped.
+    #[arg(long, env = "MW_UDP_MAX_BYTES_PER_SEC", default_value_t = 512 * 1024)]
+    pub udp_max_bytes_per_sec: u32,
+
     /// Calls `RoomLogic::on_tick` for started rooms this many times per second
     /// (0 = disabled).
     #[arg(long, env = "MW_TICK_RATE", default_value_t = 0)]

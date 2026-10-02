@@ -1,0 +1,9 @@
+; Minimal project hosting the mw_client addon and its tests.
+; Copy addons/mw_client into your game to use the client.
+
+config_version=5
+
+[application]
+
+config/name="mw_client"
+config/features=PackedStringArray("4.7")

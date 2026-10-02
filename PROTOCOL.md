@@ -84,78 +84,52 @@ receive `MatchDeleted`.
    with 3 `Ping` datagrams (`[0]`). Resend the join if none arrive. When the
    address changes, for example through NAT rebinding, join again from the new
    address.
-2. After that, every datagram from that address is relayed **verbatim** to the
-   UDP addresses of the other members of your current room. Room membership
+2. After that, every datagram from that address is relayed to the UDP
+   addresses of the other members of your current room. Room membership
    follows the TCP session: after `LeaveMatch` you stop sending and receiving.
+   - **v2 receivers** (joined with `UdpJoin`) get
+     `[sender client_id: i32 BE][datagram as sent]`. The server writes the
+     sender id, so it can't be spoofed. Senders that joined the legacy way
+     appear as `-1`.
+   - **v1 receivers** (legacy join) get the datagram exactly as sent.
+   - A relayed datagram is always at least 5 bytes, so the 1-byte `[0]`
+     acknowledgement can't be confused with one.
 3. A legacy `JoinMatch { room_id }` datagram is accepted only with
    `--legacy-udp-join`. It lets anyone who knows a room id listen in, so turn it
    off once every client sends `UdpJoin`.
+4. Each address may send at most `--udp-max-packets-per-sec` datagrams and
+   `--udp-max-bytes-per-sec` bytes per second. Anything above that is dropped.
 
-The server never parses relayed UDP payloads. A suggested envelope for sending
-voice and state on the same socket:
+### Payload convention
+
+The server doesn't parse payloads. The bundled clients
+(`mw_protocol::udp` and `godot/addons/mw_client`) start each datagram with a
+channel byte:
 
 ```
-byte 0: channel   0 = voice, 1 = state
-voice:  [sender client_id: i32 BE][opus/pcm frame]
-state:  [sequence: u32 BE][postcard RemoteObjectLocation body]
+[0 = voice][codec frame]
+[1 = state][sequence: u32 BE][postcard RemoteObjectLocation body]
+[16..255  ][free for the game]
 ```
 
-Sending `RemoteObjectLocation` over UDP avoids TCP head-of-line blocking. A lost
-segment no longer delays every update queued behind it. Receivers keep the
-highest `sequence` seen for each `(id, object_id)` and drop older datagrams.
-Keep spawns, despawns and RPCs on TCP.
+Sending `RemoteObjectLocation` over UDP avoids TCP head-of-line blocking: a lost
+segment no longer delays every update queued behind it. Senders increase
+`sequence` with every update. Receivers keep the newest sequence per
+`(sender, object_id)`, with wrap-around, and drop older ones. Keep spawns,
+despawns and RPCs on TCP, where they are reliable and ordered.
 
-## GDScript helpers
+## Rate limits (TCP)
 
-```gdscript
-# Postcard unsigned varint. GDScript ints are signed 64-bit, so a u64 token
-# with the top bit set is negative; the masked shift keeps it a logical shift.
-func put_varint(buf: PackedByteArray, v: int) -> void:
-    while true:
-        var byte := v & 0x7f
-        v = (v >> 7) & 0x01ffffffffffffff
-        if v == 0:
-            buf.append(byte)
-            return
-        buf.append(byte | 0x80)
+Each connection may send `--max-msgs-per-sec` frames and `--max-bytes-per-sec`
+bytes per second. When a client goes over, the server pauses reading its socket
+until it is back under budget. TCP flow control then slows the sender, so
+nothing is lost and other players are unaffected.
 
-func get_varint(buf: PackedByteArray, pos: int) -> Array:  # [value, next_pos]
-    var v := 0
-    var shift := 0
-    while true:
-        var byte := buf[pos]
-        pos += 1
-        v |= (byte & 0x7f) << shift
-        if byte & 0x80 == 0:
-            return [v, pos]
-        shift += 7
-    return [v, pos]
+## Godot client
 
-# TCP frame: u32 big-endian length + body.
-func frame(body: PackedByteArray) -> PackedByteArray:
-    var n := body.size()
-    var out := PackedByteArray([(n >> 24) & 0xff, (n >> 16) & 0xff, (n >> 8) & 0xff, n & 0xff])
-    out.append_array(body)
-    return out
+`godot/addons/mw_client` is a complete client:
+- `protocol.gd` encodes and decodes every packet and the UDP envelope.
+- `client.gd` is the `MwClient` node: it handles the lobby, UDP join with
+  retries, newest-wins positions, voice, and fallback to TCP until UDP is ready.
 
-func hello() -> PackedByteArray:  # Packet::Hello { protocol_version: 2 }
-    var b := PackedByteArray()
-    put_varint(b, 23)
-    put_varint(b, 2)
-    return frame(b)
-
-# Welcome body: [24][version varint][client_id zigzag varint][udp_token varint]
-func parse_welcome(body: PackedByteArray) -> Dictionary:
-    var r := get_varint(body, 1)
-    var version: int = r[0]
-    r = get_varint(body, r[1])
-    var client_id: int = (r[0] >> 1) ^ -(r[0] & 1)  # zigzag decode
-    r = get_varint(body, r[1])
-    return {"version": version, "client_id": client_id, "udp_token": r[0]}
-
-func udp_join(token: int) -> PackedByteArray:  # UDP datagram, no length prefix
-    var b := PackedByteArray()
-    put_varint(b, 27)
-    put_varint(b, token)
-    return b
-```
+`godot/run_tests.sh` checks it against the Rust golden bytes and a live server.

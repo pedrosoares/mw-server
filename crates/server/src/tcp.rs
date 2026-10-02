@@ -14,11 +14,12 @@ use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
-use tracing::{debug, warn};
+use tracing::{debug, trace, warn};
 
 use crate::config::Config;
 use crate::hub::HubEvent;
 use crate::ids::ClientId;
+use crate::rate::RateLimit;
 
 pub(crate) async fn accept_loop(
     listener: TcpListener,
@@ -83,6 +84,7 @@ async fn reader(
 ) {
     let mut read = BufReader::with_capacity(16 * 1024, read);
     let idle = config.idle_timeout();
+    let mut limit = RateLimit::new(config.max_msgs_per_sec, config.max_bytes_per_sec);
     loop {
         let frame = tokio::select! {
             biased;
@@ -92,8 +94,19 @@ async fn reader(
         };
         match frame {
             Ok(frame) => {
+                let wait = limit.reserve(frame.len());
                 if hub.send(HubEvent::Frame { id, frame }).await.is_err() {
                     return;
+                }
+                // Over budget: stop reading for a while. TCP flow control then
+                // slows the client down without losing any of its data.
+                if !wait.is_zero() {
+                    trace!(client = %id, ?wait, "throttling");
+                    tokio::select! {
+                        biased;
+                        _ = &mut kill => break,
+                        _ = tokio::time::sleep(wait) => {}
+                    }
                 }
             }
             Err(err) => {

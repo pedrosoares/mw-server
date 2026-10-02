@@ -14,13 +14,15 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use mw_protocol::Packet;
+use mw_protocol::udp::{UNKNOWN_SENDER, stamp};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::time::{Instant, MissedTickBehavior};
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::config::Config;
 use crate::ids::{ClientId, RoomId};
+use crate::rate::RateLimit;
 
 pub(crate) enum UdpControl {
     Register {
@@ -53,6 +55,18 @@ struct Peer {
     client: Option<ClientId>,
     room: Option<RoomId>,
     last_seen: Instant,
+    limit: RateLimit,
+}
+
+impl Peer {
+    fn new(client: Option<ClientId>, room: Option<RoomId>, config: &Config) -> Self {
+        Self {
+            client,
+            room,
+            last_seen: Instant::now(),
+            limit: RateLimit::new(config.udp_max_packets_per_sec, config.udp_max_bytes_per_sec),
+        }
+    }
 }
 
 struct Relay {
@@ -62,6 +76,8 @@ struct Relay {
     clients: HashMap<ClientId, ClientUdp>,
     peers: HashMap<SocketAddr, Peer>,
     rooms: HashMap<RoomId, Vec<SocketAddr>>,
+    /// Reused buffer for the sender-stamped copy of a datagram.
+    stamped: Vec<u8>,
     warned_legacy: bool,
 }
 
@@ -77,6 +93,7 @@ pub(crate) async fn run(
         clients: HashMap::new(),
         peers: HashMap::new(),
         rooms: HashMap::new(),
+        stamped: Vec::with_capacity(2048),
         warned_legacy: false,
     };
     let mut buf = vec![0u8; 64 * 1024];
@@ -106,6 +123,10 @@ impl Relay {
     async fn on_datagram(&mut self, data: &[u8], src: SocketAddr) {
         if let Some(peer) = self.peers.get_mut(&src) {
             peer.last_seen = Instant::now();
+            if !peer.limit.try_take(data.len()) {
+                trace!(%src, "udp rate limit exceeded, datagram dropped");
+                return;
+            }
             let client = peer.client;
             let room = peer.room;
             // A retransmitted join (its acks got lost) is answered, not relayed,
@@ -117,13 +138,24 @@ impl Relay {
                 self.ack(src).await;
                 return;
             }
-            if let Some(targets) = room.and_then(|room| self.rooms.get(&room)) {
-                for &target in targets {
-                    if target != src
-                        && let Err(err) = self.socket.send_to(data, target).await
-                    {
-                        debug!(%err, %target, "udp send failed");
-                    }
+            if data.is_empty() {
+                return;
+            }
+            let Some(targets) = room.and_then(|room| self.rooms.get(&room)) else {
+                return;
+            };
+            // v2 receivers get the sender id the server vouches for; v1
+            // receivers get the datagram untouched.
+            let sender = client.map_or(UNKNOWN_SENDER, ClientId::wire);
+            stamp(sender, data, &mut self.stamped);
+            for &target in targets {
+                if target == src {
+                    continue;
+                }
+                let modern = self.peers.get(&target).is_some_and(|p| p.client.is_some());
+                let datagram = if modern { &self.stamped[..] } else { data };
+                if let Err(err) = self.socket.send_to(datagram, target).await {
+                    debug!(%err, %target, "udp send failed");
                 }
             }
             return;
@@ -142,14 +174,8 @@ impl Relay {
                     return;
                 };
                 info!(%src, %room, "legacy udp peer joined");
-                self.peers.insert(
-                    src,
-                    Peer {
-                        client: None,
-                        room: Some(room),
-                        last_seen: Instant::now(),
-                    },
-                );
+                self.peers
+                    .insert(src, Peer::new(None, Some(room), &self.config));
                 self.rooms.entry(room).or_default().push(src);
                 self.ack(src).await;
             }
@@ -179,14 +205,8 @@ impl Relay {
             self.forget_addr(old);
         }
         info!(%client, %src, "udp peer joined");
-        self.peers.insert(
-            src,
-            Peer {
-                client: Some(client),
-                room,
-                last_seen: Instant::now(),
-            },
-        );
+        self.peers
+            .insert(src, Peer::new(Some(client), room, &self.config));
         if let Some(room) = room {
             self.rooms.entry(room).or_default().push(src);
         }
@@ -210,20 +230,8 @@ impl Relay {
                     return;
                 };
                 state.room = room;
-                let Some(addr) = state.addr else {
-                    return;
-                };
-                self.forget_addr(addr);
-                self.peers.insert(
-                    addr,
-                    Peer {
-                        client: Some(client),
-                        room,
-                        last_seen: Instant::now(),
-                    },
-                );
-                if let Some(room) = room {
-                    self.rooms.entry(room).or_default().push(addr);
+                if let Some(addr) = state.addr {
+                    self.move_peer(addr, room);
                 }
             }
             UdpControl::Unregister { client } => {
@@ -246,17 +254,35 @@ impl Relay {
         }
     }
 
-    fn forget_addr(&mut self, addr: SocketAddr) {
-        let Some(peer) = self.peers.remove(&addr) else {
+    /// Moves a bound address to another room, keeping its rate limit state.
+    fn move_peer(&mut self, addr: SocketAddr, room: Option<RoomId>) {
+        let Some(peer) = self.peers.get_mut(&addr) else {
             return;
         };
-        if let Some(room) = peer.room
-            && let Some(addrs) = self.rooms.get_mut(&room)
-        {
+        let old = std::mem::replace(&mut peer.room, room);
+        if let Some(old) = old {
+            self.remove_from_room(old, addr);
+        }
+        if let Some(room) = room {
+            self.rooms.entry(room).or_default().push(addr);
+        }
+    }
+
+    fn remove_from_room(&mut self, room: RoomId, addr: SocketAddr) {
+        if let Some(addrs) = self.rooms.get_mut(&room) {
             addrs.retain(|&a| a != addr);
             if addrs.is_empty() {
                 self.rooms.remove(&room);
             }
+        }
+    }
+
+    fn forget_addr(&mut self, addr: SocketAddr) {
+        let Some(peer) = self.peers.remove(&addr) else {
+            return;
+        };
+        if let Some(room) = peer.room {
+            self.remove_from_room(room, addr);
         }
     }
 
