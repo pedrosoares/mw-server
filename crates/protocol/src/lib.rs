@@ -7,12 +7,11 @@
 //! index followed by the fields, so **the order of the [`Packet`] variants is
 //! part of the wire format**: only ever append new variants at the end.
 //!
-//! # Versions
+//! # Handshake
 //!
-//! Variants up to and including [`Packet::Message`] are protocol v1 (the
-//! original Godot client). Clients that send [`Packet::Hello`] opt into v2 and
-//! may receive the v2-only variants (`Welcome`, `Error`, `Game`). Legacy
-//! clients never receive a v2 variant.
+//! The first packet of every connection must be [`Packet::Hello`] with
+//! [`PROTOCOL_VERSION`]; the server answers [`Packet::Welcome`] or closes the
+//! connection.
 //!
 //! See `PROTOCOL.md` at the repository root for the full flow.
 
@@ -32,7 +31,6 @@ pub type Vec3 = (f32, f32, f32);
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
 pub enum Packet {
-    // ---- v1: keep order and fields unchanged ----
     Ping,
     Disconnect,
     LoginRequest {
@@ -117,8 +115,7 @@ pub enum Packet {
         text: String,
     },
 
-    // ---- v2: only exchanged after the client sent `Hello` ----
-    /// Client -> server, first packet of a v2 client.
+    /// Client -> server, mandatory first packet.
     Hello {
         protocol_version: u16,
     },
@@ -138,7 +135,7 @@ pub enum Packet {
         kind: u16,
         payload: Vec<u8>,
     },
-    /// UDP only: first datagram of a v2 client, binds its address to its session.
+    /// UDP only: first datagram, binds the sender's address to its session.
     UdpJoin {
         token: u64,
     },
@@ -210,11 +207,6 @@ impl Tag {
         Tag::UdpJoin,
     ];
 
-    /// v2-only packets are never sent to clients that did not send `Hello`.
-    pub fn is_v2(self) -> bool {
-        self as u8 >= Tag::Hello as u8
-    }
-
     pub fn from_index(index: u32) -> Option<Tag> {
         Self::ALL.get(index as usize).copied()
     }
@@ -243,6 +235,8 @@ pub enum ErrorCode {
     UnsupportedVersion,
     /// The packet could not be decoded.
     Malformed,
+    /// The match already started; it can no longer be joined.
+    MatchStarted,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
@@ -466,9 +460,9 @@ mod tests {
         ]
     }
 
-    /// Frames produced by protocol v1 (commit fd69794). The Godot client
-    /// depends on these bytes, so they must never change.
-    const V1_GOLDEN: [&[u8]; 23] = [
+    /// Frames as produced since commit fd69794. Clients in other languages
+    /// (GDScript, the godot-network adapter) depend on these bytes.
+    const GOLDEN: [&[u8]; 23] = [
         &[0, 0, 0, 1, 0],
         &[0, 0, 0, 1, 1],
         &[0, 0, 0, 4, 2, 2, 97, 98],
@@ -506,8 +500,8 @@ mod tests {
     ];
 
     #[test]
-    fn v1_wire_format_is_unchanged() {
-        for (packet, golden) in samples().iter().zip(V1_GOLDEN) {
+    fn wire_format_is_unchanged() {
+        for (packet, golden) in samples().iter().zip(GOLDEN) {
             assert_eq!(packet.encode_frame(), golden, "{packet:?}");
             assert_eq!(&Packet::decode(&golden[HEADER_LEN..]).unwrap(), packet);
         }

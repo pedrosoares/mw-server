@@ -86,15 +86,8 @@ impl Client {
         }
     }
 
-    /// A v1 client: connect + login.
-    fn legacy(server: &TestServer, name: &str) -> Self {
-        let mut client = Self::connect(server);
-        client.login(name);
-        client
-    }
-
-    /// A v2 client: connect + hello + login.
-    fn modern(server: &TestServer, name: &str) -> Self {
+    /// Connect + Hello + login.
+    fn player(server: &TestServer, name: &str) -> Self {
         let mut client = Self::connect(server);
         client.send(&Packet::Hello {
             protocol_version: PROTOCOL_VERSION,
@@ -198,17 +191,17 @@ fn joined(room: i32, user: &Client, user_name: &str, room_name: &str) -> Packet 
 #[test]
 fn lobby_and_relay_flow() {
     let server = start(|_| {});
-    let mut watcher = Client::legacy(&server, "watcher");
+    let mut watcher = Client::player(&server, "watcher");
     watcher.send(&Packet::ListMatches);
     watcher.expect(Packet::MatchList { matches: vec![] });
 
-    let mut host = Client::legacy(&server, "host");
+    let mut host = Client::player(&server, "host");
     let room = host.create_room("room");
     watcher.expect(Packet::MatchList {
         matches: vec![(room, "room".into(), 1)],
     });
 
-    let mut guest = Client::legacy(&server, "guest");
+    let mut guest = Client::player(&server, "guest");
     guest.send(&Packet::JoinMatch { room_id: room });
     guest.expect(joined(room, &host, "host", "room"));
     guest.expect(joined(room, &guest, "guest", "room"));
@@ -258,9 +251,8 @@ fn lobby_and_relay_flow() {
     };
     host.send(&start);
     guest.expect(start);
-    watcher.expect(Packet::MatchList {
-        matches: vec![(room, "room".into(), 2)],
-    });
+    // Started matches leave the list.
+    watcher.expect(Packet::MatchList { matches: vec![] });
 
     host.send(&Packet::SpawnPlayers {
         room_id: room,
@@ -278,9 +270,7 @@ fn lobby_and_relay_flow() {
         user_id: guest.id,
         user_name: "guest".into(),
     });
-    watcher.expect(Packet::MatchList {
-        matches: vec![(room, "room".into(), 1)],
-    });
+    watcher.expect(Packet::MatchList { matches: vec![] });
 
     drop(host);
     watcher.expect(Packet::MatchList { matches: vec![] });
@@ -290,9 +280,9 @@ fn lobby_and_relay_flow() {
 #[test]
 fn host_disconnect_deletes_room_and_frees_guests() {
     let server = start(|_| {});
-    let mut host = Client::legacy(&server, "host");
+    let mut host = Client::player(&server, "host");
     let room = host.create_room("r");
-    let mut guest = Client::legacy(&server, "guest");
+    let mut guest = Client::player(&server, "guest");
     guest.join_room(room, 1);
     host.recv(); // MatchJoined(guest)
 
@@ -306,9 +296,9 @@ fn host_disconnect_deletes_room_and_frees_guests() {
 #[test]
 fn guest_disconnect_notifies_room() {
     let server = start(|_| {});
-    let mut host = Client::legacy(&server, "host");
+    let mut host = Client::player(&server, "host");
     let room = host.create_room("r");
-    let mut guest = Client::legacy(&server, "guest");
+    let mut guest = Client::player(&server, "guest");
     guest.join_room(room, 1);
     host.recv(); // MatchJoined(guest)
     let guest_id = guest.id;
@@ -323,9 +313,9 @@ fn guest_disconnect_notifies_room() {
 #[test]
 fn room_management_is_checked() {
     let server = start(|config| config.max_room_players = 2);
-    let mut host_a = Client::modern(&server, "a");
+    let mut host_a = Client::player(&server, "a");
     let room_a = host_a.create_room("a");
-    let mut host_b = Client::modern(&server, "b");
+    let mut host_b = Client::player(&server, "b");
     let room_b = host_b.create_room("b");
 
     // Can't manage a room you're not in.
@@ -339,7 +329,7 @@ fn room_management_is_checked() {
     ));
 
     // Guests can't manage their room.
-    let mut guest = Client::modern(&server, "guest");
+    let mut guest = Client::player(&server, "guest");
     guest.join_room(room_a, 1);
     host_a.recv(); // MatchJoined(guest)
     guest.send(&Packet::StartMatch {
@@ -355,8 +345,8 @@ fn room_management_is_checked() {
     ));
     host_a.assert_silent();
 
-    // Full and missing rooms: v2 gets an Error, v1 gets MatchDeleted.
-    let mut late = Client::modern(&server, "late");
+    // Full and missing rooms are refused.
+    let mut late = Client::player(&server, "late");
     late.send(&Packet::JoinMatch { room_id: room_a });
     assert!(matches!(
         late.recv(),
@@ -373,10 +363,6 @@ fn room_management_is_checked() {
             ..
         }
     ));
-    let mut legacy = Client::legacy(&server, "legacy");
-    legacy.send(&Packet::JoinMatch { room_id: 4242 });
-    legacy.expect(Packet::MatchDeleted);
-
     // Room B is untouched.
     host_b.send(&Packet::DeleteMatch { room_id: room_b });
     host_b.assert_silent();
@@ -386,11 +372,18 @@ fn room_management_is_checked() {
 #[test]
 fn bad_input_does_not_hurt_the_server() {
     let server = start(|config| config.max_frame_len = 1024);
-    let mut bystander = Client::legacy(&server, "bystander");
+    let mut bystander = Client::player(&server, "bystander");
 
-    // Undecodable body: ignored, connection kept.
-    let mut client = Client::legacy(&server, "client");
+    // Undecodable body: reported, connection kept.
+    let mut client = Client::player(&server, "client");
     client.stream.write_all(&[0, 0, 0, 2, 250, 1]).unwrap();
+    assert!(matches!(
+        client.recv(),
+        Packet::Error {
+            code: ErrorCode::Malformed,
+            ..
+        }
+    ));
     client.login("still-alive");
 
     // Oversized frame: connection closed, nothing allocated.
@@ -405,6 +398,94 @@ fn bad_input_does_not_hurt_the_server() {
     assert!(matches!(client.recv(), Packet::Login { name, .. } if name.starts_with("Player")));
 
     bystander.login("ok");
+}
+
+#[test]
+fn hello_is_mandatory() {
+    let server = start(|_| {});
+    let mut client = Client::connect(&server);
+    client.send(&Packet::LoginRequest { name: "x".into() });
+    assert!(matches!(
+        client.recv(),
+        Packet::Error {
+            code: ErrorCode::UnsupportedVersion,
+            ..
+        }
+    ));
+    client.assert_closed();
+}
+
+#[test]
+fn started_matches_are_hidden_and_closed() {
+    let server = start(|_| {});
+    let mut watcher = Client::player(&server, "watcher");
+    watcher.send(&Packet::ListMatches);
+    watcher.expect(Packet::MatchList { matches: vec![] });
+    let mut host = Client::player(&server, "host");
+    let room = host.create_room("r");
+    watcher.expect(Packet::MatchList {
+        matches: vec![(room, "r".into(), 1)],
+    });
+
+    host.send(&Packet::StartMatch {
+        room_id: room,
+        map: "m".into(),
+    });
+    watcher.expect(Packet::MatchList { matches: vec![] });
+
+    let mut late = Client::player(&server, "late");
+    late.send(&Packet::JoinMatch { room_id: room });
+    assert!(matches!(
+        late.recv(),
+        Packet::Error {
+            code: ErrorCode::MatchStarted,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn players_cannot_act_for_others() {
+    let server = start(|_| {});
+    let mut host = Client::player(&server, "host");
+    let room = host.create_room("r");
+    let mut guest = Client::player(&server, "guest");
+    guest.join_room(room, 1);
+    host.recv(); // MatchJoined(guest)
+
+    let spoofed = [
+        Packet::RemoteObjectLocation {
+            id: host.id,
+            object_id: 1,
+            position: (0.0, 0.0, 0.0),
+            rotation: (0.0, 0.0, 0.0),
+        },
+        Packet::DespawnRemoteObject {
+            id: host.id,
+            object_id: 1,
+        },
+        Packet::RemoteObjectCall {
+            id: host.id,
+            object_id: 1,
+            method: "die".into(),
+            params: vec![],
+            broadcast: true,
+        },
+        Packet::Spawn {
+            position: (0.0, 0.0, 0.0),
+        },
+    ];
+    for packet in spoofed {
+        guest.send(&packet);
+        assert!(matches!(
+            guest.recv(),
+            Packet::Error {
+                code: ErrorCode::InvalidState,
+                ..
+            }
+        ));
+    }
+    host.assert_silent();
 }
 
 #[test]
@@ -460,9 +541,9 @@ fn expect_acks(socket: &UdpSocket) {
 #[test]
 fn udp_voice_is_authenticated_and_scoped_to_the_room() {
     let server = start(|_| {});
-    let mut host = Client::modern(&server, "host");
+    let mut host = Client::player(&server, "host");
     let room = host.create_room("r");
-    let mut guest = Client::modern(&server, "guest");
+    let mut guest = Client::player(&server, "guest");
     guest.join_room(room, 1);
     host.recv(); // MatchJoined(guest)
 
@@ -519,7 +600,7 @@ fn udp_voice_is_authenticated_and_scoped_to_the_room() {
     }
     assert_eq!(applied, [5, 6]);
 
-    // Wrong token and the legacy join are rejected by default.
+    // A wrong token and the removed v1 join are ignored.
     let intruder = udp_join(&server, &Packet::UdpJoin { token: 12345 });
     let legacy = udp_join(&server, &Packet::JoinMatch { room_id: room });
     udp_assert_silent(&intruder);
@@ -535,51 +616,11 @@ fn udp_voice_is_authenticated_and_scoped_to_the_room() {
 }
 
 #[test]
-fn legacy_udp_join_can_be_enabled() {
-    let server = start(|config| config.legacy_udp_join = true);
-    let a = udp_join(&server, &Packet::JoinMatch { room_id: 1 });
-    expect_acks(&a);
-    let b = udp_join(&server, &Packet::JoinMatch { room_id: 1 });
-    expect_acks(&b);
-    let other_room = udp_join(&server, &Packet::JoinMatch { room_id: 2 });
-    expect_acks(&other_room);
-
-    a.send_to(b"hello", server.udp).unwrap();
-    assert_eq!(udp_recv(&b), b"hello");
-    udp_assert_silent(&other_room);
-}
-
-#[test]
-fn mixed_room_stamps_only_for_v2_receivers() {
-    let server = start(|config| config.legacy_udp_join = true);
-    let mut host = Client::modern(&server, "host");
-    let room = host.create_room("r");
-    let host_udp = udp_join(
-        &server,
-        &Packet::UdpJoin {
-            token: host.udp_token,
-        },
-    );
-    expect_acks(&host_udp);
-    let legacy_udp = udp_join(&server, &Packet::JoinMatch { room_id: room });
-    expect_acks(&legacy_udp);
-
-    host_udp.send_to(b"\0from-v2", server.udp).unwrap();
-    assert_eq!(udp_recv(&legacy_udp), b"\0from-v2");
-
-    legacy_udp.send_to(b"\0from-v1", server.udp).unwrap();
-    let received = udp_recv(&host_udp);
-    let relayed = Relayed::parse(&received).unwrap();
-    assert_eq!(relayed.sender, udp_proto::UNKNOWN_SENDER);
-    assert_eq!(relayed.payload, b"from-v1");
-}
-
-#[test]
 fn udp_excess_is_dropped() {
     let server = start(|config| config.udp_max_packets_per_sec = 5);
-    let mut host = Client::modern(&server, "host");
+    let mut host = Client::player(&server, "host");
     let room = host.create_room("r");
-    let mut guest = Client::modern(&server, "guest");
+    let mut guest = Client::player(&server, "guest");
     guest.join_room(room, 1);
     let host_udp = udp_join(
         &server,
@@ -611,9 +652,9 @@ fn udp_excess_is_dropped() {
 #[test]
 fn tcp_flood_is_throttled_without_loss() {
     let server = start(|config| config.max_msgs_per_sec = 20);
-    let mut host = Client::legacy(&server, "host");
+    let mut host = Client::player(&server, "host");
     let room = host.create_room("r");
-    let mut guest = Client::legacy(&server, "guest");
+    let mut guest = Client::player(&server, "guest");
     guest.join_room(room, 1);
     host.recv(); // MatchJoined(guest)
 
@@ -678,16 +719,11 @@ fn room_logic_routes_game_packets() {
         |config| config.tick_rate = 50,
         |config| Server::new(config).with_room_logic(|_| Box::new(TestLogic::default())),
     );
-    let mut host = Client::modern(&server, "host");
+    let mut host = Client::player(&server, "host");
     let room = host.create_room("r");
-    let mut guest = Client::modern(&server, "guest");
+    let mut guest = Client::player(&server, "guest");
     guest.join_room(room, 1);
     host.recv();
-    let mut old = Client::legacy(&server, "old");
-    old.join_room(room, 2);
-    host.recv();
-    guest.recv();
-
     guest.send(&Packet::Game {
         kind: 1,
         payload: vec![1, 2, 3],
@@ -698,8 +734,6 @@ fn room_logic_routes_game_packets() {
     };
     host.expect(answer.clone());
     guest.expect(answer);
-    // v1 clients never see v2 packets.
-    old.assert_silent();
 
     let to_host = Packet::Game {
         kind: 5,
@@ -714,12 +748,10 @@ fn room_logic_routes_game_packets() {
         map: "m".into(),
     });
     guest.recv(); // StartMatch
-    old.recv(); // StartMatch
     let tick = Packet::Game {
         kind: 9,
         payload: vec![],
     };
     host.expect(tick.clone());
     guest.expect(tick);
-    old.assert_silent();
 }

@@ -45,13 +45,12 @@ const PACKETS := [
 ]
 
 ## Error.code values.
-enum ErrorCode { INVALID_STATE, ROOM_NOT_FOUND, ROOM_FULL, NOT_OWNER, UNSUPPORTED_VERSION, MALFORMED }
+enum ErrorCode { INVALID_STATE, ROOM_NOT_FOUND, ROOM_FULL, NOT_OWNER, UNSUPPORTED_VERSION, MALFORMED, MATCH_STARTED }
 
 # UDP channels (see crates/protocol/src/udp.rs).
 const CHANNEL_VOICE := 0
 const CHANNEL_STATE := 1
 const CHANNEL_GAME := 16
-const UNKNOWN_SENDER := -1
 
 # RawPacket variant tags.
 enum Raw { STRING, INT, BOOL, FLOAT, VECTOR3, ARRAY, NULL }

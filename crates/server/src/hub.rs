@@ -102,7 +102,7 @@ impl Hub {
         let bye = frame(&Packet::Disconnect);
         let ids: Vec<ClientId> = self.clients.map.keys().copied().collect();
         for id in ids {
-            self.clients.send_frame(id, Tag::Disconnect, &bye);
+            self.clients.send_frame(id, &bye);
         }
         // Dropping the sessions closes every outbound queue; writers flush
         // what is queued and close their sockets.
@@ -139,6 +139,7 @@ impl Hub {
             return;
         };
         let room = session.room;
+        let greeted = session.greeted;
         let packet = match Packet::decode(&raw[HEADER_LEN..]) {
             Ok(packet) => packet,
             Err(err) => {
@@ -153,10 +154,20 @@ impl Hub {
         trace!(client = %id, ?packet, "packet");
         let tag = packet.tag();
 
+        if !greeted && tag != Tag::Hello {
+            self.reject(
+                id,
+                ErrorCode::UnsupportedVersion,
+                "the first packet must be Hello",
+            );
+            self.remove_client(id, "no Hello");
+            return;
+        }
+
         match (packet, room) {
             (Packet::Ping, _) => {}
             (Packet::Disconnect, _) => self.remove_client(id, "client sent Disconnect"),
-            (Packet::Hello { protocol_version }, _) => self.hello(id, protocol_version),
+            (Packet::Hello { protocol_version }, _) if !greeted => self.hello(id, protocol_version),
             (Packet::RemoveFromListMatches, _) => {
                 if let Some(session) = self.clients.map.get_mut(&id) {
                     session.listing = false;
@@ -202,30 +213,40 @@ impl Hub {
             }
 
             // ---- in-match relay ----
+            // `id` is the owner of the object: clients may only announce and
+            // move their own objects, so nobody can puppet another player.
             (
-                Packet::SpawnRemoteObject { .. }
-                | Packet::DespawnRemoteObject { .. }
-                | Packet::RemoteObjectLocation { .. }
-                | Packet::Spawn { .. },
-                Some(room),
-            ) => self.relay(id, room, Route::Others, tag, &raw),
-            (
-                Packet::RemoteObjectCall {
-                    id: target,
-                    broadcast,
+                Packet::SpawnRemoteObject { id: owner, .. }
+                | Packet::DespawnRemoteObject { id: owner, .. }
+                | Packet::RemoteObjectLocation { id: owner, .. }
+                | Packet::RemoteObjectCall {
+                    id: owner,
+                    broadcast: true,
                     ..
                 },
                 Some(room),
             ) => {
-                let route = if broadcast {
-                    Route::Others
+                if owner == id.wire() {
+                    self.relay(id, room, Route::Others, &raw);
                 } else {
-                    match ClientId::from_wire(target) {
-                        Some(target) => Route::To(target),
-                        None => Route::Drop,
-                    }
-                };
-                self.relay(id, room, route, tag, &raw);
+                    self.reject(
+                        id,
+                        ErrorCode::InvalidState,
+                        "object belongs to another player",
+                    );
+                }
+            }
+            // A targeted call goes to the owner of the object it acts on.
+            (
+                Packet::RemoteObjectCall {
+                    id: target,
+                    broadcast: false,
+                    ..
+                },
+                Some(room),
+            ) => {
+                let route = ClientId::from_wire(target).map_or(Route::Drop, Route::To);
+                self.relay(id, room, route, &raw);
             }
             (Packet::Message { text, .. }, Some(room)) => {
                 // Rewrite the sender so clients can't impersonate each other.
@@ -234,14 +255,14 @@ impl Hub {
                     name: self.clients.name(id).to_owned(),
                     text,
                 };
-                self.relay(id, room, Route::Others, tag, &frame(&message));
+                self.relay(id, room, Route::Others, &frame(&message));
             }
             (Packet::Game { kind, payload }, Some(room)) => {
                 let mut route = Route::Others;
                 self.with_logic(room, |logic, ctx| {
                     route = logic.on_game_packet(ctx, id, kind, &payload);
                 });
-                self.relay(id, room, route, tag, &raw);
+                self.relay(id, room, route, &raw);
             }
 
             (packet, _) => {
@@ -255,7 +276,7 @@ impl Hub {
         let Some(session) = self.clients.map.get_mut(&id) else {
             return;
         };
-        session.modern = true;
+        session.greeted = true;
         if version != PROTOCOL_VERSION {
             let message = format!("server speaks protocol {PROTOCOL_VERSION}, client {version}");
             self.reject(id, ErrorCode::UnsupportedVersion, &message);
@@ -318,12 +339,19 @@ impl Hub {
     fn join_room(&mut self, id: ClientId, wire_room: i32) {
         let room_id = RoomId::from_wire(wire_room).filter(|room| self.rooms.contains_key(room));
         let Some(room_id) = room_id else {
-            self.join_failed(id, ErrorCode::RoomNotFound, "room does not exist");
+            self.reject(id, ErrorCode::RoomNotFound, "room does not exist");
             return;
         };
+        let room = &self.rooms[&room_id];
+        // Late joiners would never get StartMatch/Spawn nor the objects
+        // spawned so far, so started matches are closed.
+        if room.started {
+            self.reject(id, ErrorCode::MatchStarted, "match already started");
+            return;
+        }
         let max = self.config.max_room_players;
-        if max > 0 && self.rooms[&room_id].members.len() >= max {
-            self.join_failed(id, ErrorCode::RoomFull, "room is full");
+        if max > 0 && room.members.len() >= max {
+            self.reject(id, ErrorCode::RoomFull, "room is full");
             return;
         }
 
@@ -349,22 +377,11 @@ impl Hub {
             };
             self.clients.send(id, &about_member);
             if member != id {
-                self.clients.send_frame(member, Tag::MatchJoined, &joined);
+                self.clients.send_frame(member, &joined);
             }
         }
         self.with_logic(room_id, |logic, ctx| logic.on_join(ctx, id));
         self.broadcast_match_list();
-    }
-
-    /// v1 clients don't understand `Error`; `MatchDeleted` sends them back to
-    /// the lobby instead of leaving them waiting for a join that never comes.
-    fn join_failed(&mut self, id: ClientId, code: ErrorCode, message: &str) {
-        if self.clients.map.get(&id).is_some_and(|s| s.modern) {
-            self.reject(id, code, message);
-        } else {
-            debug!(client = %id, ?code, message, "join failed");
-            self.clients.send(id, &Packet::MatchDeleted);
-        }
     }
 
     fn leave_room(&mut self, id: ClientId) {
@@ -383,7 +400,7 @@ impl Hub {
             user_name: self.clients.name(id).to_owned(),
         });
         for &member in &room.members {
-            self.clients.send_frame(member, Tag::MatchLeaved, &left);
+            self.clients.send_frame(member, &left);
         }
         self.with_logic(room_id, |logic, ctx| logic.on_leave(ctx, id));
         self.broadcast_match_list();
@@ -398,10 +415,9 @@ impl Hub {
         for &member in &room.members {
             self.set_room(member, None);
             if member != room.owner {
-                self.clients.send_frame(member, Tag::MatchDeleted, &deleted);
+                self.clients.send_frame(member, &deleted);
             }
         }
-        self.udp(UdpControl::RoomClosed { room: room_id });
         self.broadcast_match_list();
     }
 
@@ -410,7 +426,7 @@ impl Hub {
             room.started = true;
         }
         info!(room = %room_id, map, "match started");
-        self.relay(owner, room_id, Route::Others, Tag::StartMatch, frame);
+        self.relay(owner, room_id, Route::Others, frame);
         self.with_logic(room_id, |logic, ctx| logic.on_start(ctx, map));
         self.broadcast_match_list();
     }
@@ -432,7 +448,7 @@ impl Hub {
     }
 
     /// Forwards an already encoded frame inside a room.
-    fn relay(&mut self, from: ClientId, room_id: RoomId, route: Route, tag: Tag, frame: &Bytes) {
+    fn relay(&mut self, from: ClientId, room_id: RoomId, route: Route, frame: &Bytes) {
         let Some(room) = self.rooms.get(&room_id) else {
             return;
         };
@@ -440,13 +456,13 @@ impl Hub {
             Route::Others | Route::All => {
                 for &member in &room.members {
                     if route == Route::All || member != from {
-                        self.clients.send_frame(member, tag, frame);
+                        self.clients.send_frame(member, frame);
                     }
                 }
             }
-            Route::Owner => self.clients.send_frame(room.owner, tag, frame),
+            Route::Owner => self.clients.send_frame(room.owner, frame),
             Route::To(target) if room.members.contains(&target) => {
-                self.clients.send_frame(target, tag, frame);
+                self.clients.send_frame(target, frame);
             }
             Route::To(target) => debug!(client = %from, %target, "target not in room"),
             Route::Drop => {}
@@ -482,6 +498,7 @@ impl Hub {
             matches: self
                 .rooms
                 .values()
+                .filter(|room| !room.started)
                 .map(|room| (room.id.wire(), room.name.clone(), room.members.len() as i32))
                 .collect(),
         }
@@ -500,7 +517,7 @@ impl Hub {
         }
         let list = frame(&self.match_list());
         for id in subscribers {
-            self.clients.send_frame(id, Tag::MatchList, &list);
+            self.clients.send_frame(id, &list);
         }
     }
 
@@ -557,16 +574,14 @@ impl Hub {
         f(room.logic.as_mut(), &mut ctx);
     }
 
-    /// Logs a refused request and tells v2 clients why.
+    /// Logs a refused request and tells the client why.
     fn reject(&mut self, id: ClientId, code: ErrorCode, message: &str) {
         debug!(client = %id, ?code, message, "rejected");
-        if self.clients.map.get(&id).is_some_and(|s| s.modern) {
-            let error = Packet::Error {
-                code,
-                message: message.to_owned(),
-            };
-            self.clients.send(id, &error);
-        }
+        let error = Packet::Error {
+            code,
+            message: message.to_owned(),
+        };
+        self.clients.send(id, &error);
     }
 
     fn sanitize(&self, name: &str, fallback: impl FnOnce() -> String) -> String {

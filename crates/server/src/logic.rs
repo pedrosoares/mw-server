@@ -101,7 +101,7 @@ impl RoomCtx<'_> {
         let encoded = frame(packet);
         for &member in self.members {
             if Some(member) != except {
-                self.clients.send_frame(member, packet.tag(), &encoded);
+                self.clients.send_frame(member, &encoded);
             }
         }
     }

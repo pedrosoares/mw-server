@@ -11,12 +11,12 @@ pub struct RoomId(pub u32);
 macro_rules! wire_id {
     ($ty:ident) => {
         impl $ty {
-            /// The id as sent on the wire (`i32` in protocol v1).
+            /// The id as sent on the wire (`i32`).
             pub fn wire(self) -> i32 {
                 self.0 as i32
             }
 
-            /// Parses a wire id; negative values (v1 used `-1` for "none") are rejected.
+            /// Parses a wire id; negative values (`-1` means "none") are rejected.
             pub fn from_wire(id: i32) -> Option<Self> {
                 u32::try_from(id).ok().map(Self)
             }

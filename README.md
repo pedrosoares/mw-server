@@ -15,8 +15,9 @@ template:
 - **`RoomLogic`**: plug in server-side game rules (scores, timers, validation)
   without touching the networking.
 
-The wire format is documented in [PROTOCOL.md](PROTOCOL.md). It is backwards
-compatible with the original (v1) Godot client.
+The wire format is documented in [PROTOCOL.md](PROTOCOL.md). Clients:
+[godot-network](https://github.com/pedrosoares/godot-network), a Rust
+GDExtension, and the GDScript addon in [`godot/`](godot).
 
 ## Run
 
@@ -39,8 +40,6 @@ Every flag also reads an env var:
 | `--write-timeout-secs` | `MW_WRITE_TIMEOUT_SECS` | `10` | |
 | `--idle-timeout-secs` | `MW_IDLE_TIMEOUT_SECS` | `0` | Only enable it if clients send `Ping`. |
 | `--keepalive-secs` | `MW_KEEPALIVE_SECS` | `15` | TCP keepalive, detects dead peers. |
-| `--legacy-udp-join` | `MW_LEGACY_UDP_JOIN` | off | Accept the unauthenticated v1 UDP join. |
-| `--udp-peer-timeout-secs` | `MW_UDP_PEER_TIMEOUT_SECS` | `30` | Forget silent legacy UDP peers. |
 | `--max-msgs-per-sec` | `MW_MAX_MSGS_PER_SEC` | `1000` | TCP frames per client per second; over that, the client is throttled. |
 | `--max-bytes-per-sec` | `MW_MAX_BYTES_PER_SEC` | `1048576` | TCP bytes per client per second, throttled the same way. |
 | `--udp-max-packets-per-sec` | `MW_UDP_MAX_PACKETS_PER_SEC` | `500` | Excess datagrams are dropped. |
@@ -139,12 +138,13 @@ Windows.
 
 ## Benchmark
 
-Run on localhost with one room. Every client sends `RemoteObjectLocation` at the
-given rate for 5 s, and the table shows the relay latency to each other member.
-The same v1 client was used for both servers.
+Run on localhost with one room. Every client sends `RemoteObjectLocation` over
+TCP at the given rate for 5 s, and the table shows the relay latency to each
+other member. The client is identical in both runs except that it sends `Hello`
+to the new server.
 
 | Scenario | v0.1 (fd69794) p50 / p99 | v0.2 p50 / p99 |
 |---|---|---|
-| 8 clients × 60 Hz | 8.25 / 14.8 ms | 0.028 / 0.117 ms |
-| 16 clients × 120 Hz | 4.20 / 8.18 ms | 0.027 / 0.102 ms |
-| 32 clients × 60 Hz | 4.12 / 10.2 ms | 0.037 / 0.111 ms |
+| 8 clients × 60 Hz | 8.25 / 14.8 ms | 0.026 / 0.060 ms |
+| 16 clients × 120 Hz | 4.20 / 8.18 ms | 0.027 / 0.096 ms |
+| 32 clients × 60 Hz | 4.12 / 10.2 ms | 0.037 / 0.169 ms |

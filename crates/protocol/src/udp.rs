@@ -4,9 +4,8 @@
 //! bundled clients use on top of it.
 //!
 //! - client → server: `[channel: u8][payload]` (after `UdpJoin`)
-//! - server → v2 client: `[sender client_id: i32 BE][channel: u8][payload]`.
+//! - server → client: `[sender client_id: i32 BE][channel: u8][payload]`.
 //!   The server writes the sender id, so receivers can trust it.
-//! - server → v1 client: the datagram exactly as sent (no sender id).
 //! - The join acknowledgement is the 1-byte `Ping` datagram `[0]`. Relayed
 //!   datagrams are always at least `SENDER_LEN + 1` bytes long.
 //!
@@ -18,14 +17,12 @@ use std::collections::HashMap;
 
 use crate::Packet;
 
-/// Length of the sender id the server prepends for v2 receivers.
+/// Length of the sender id the server prepends.
 pub const SENDER_LEN: usize = 4;
 pub const CHANNEL_VOICE: u8 = 0;
 pub const CHANNEL_STATE: u8 = 1;
 /// Channels from this one on are free for game use.
 pub const CHANNEL_GAME: u8 = 16;
-/// Sender id stamped on datagrams from legacy (unauthenticated) peers.
-pub const UNKNOWN_SENDER: i32 = -1;
 
 /// Writes `datagram` prefixed with the sender id into `out` (server side).
 pub fn stamp(sender: i32, datagram: &[u8], out: &mut Vec<u8>) {
@@ -38,7 +35,7 @@ pub fn is_join_ack(datagram: &[u8]) -> bool {
     datagram == [0]
 }
 
-/// A datagram as received by a v2 client.
+/// A datagram as received by a client.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Relayed<'a> {
     pub sender: i32,

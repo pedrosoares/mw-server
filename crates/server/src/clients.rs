@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 
 use bytes::Bytes;
-use mw_protocol::{Packet, Tag};
+use mw_protocol::Packet;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
@@ -13,8 +13,8 @@ pub(crate) struct Session {
     pub addr: SocketAddr,
     pub name: String,
     pub room: Option<RoomId>,
-    /// Sent `Hello`, so it understands v2 packets.
-    pub modern: bool,
+    /// Completed the `Hello` handshake.
+    pub greeted: bool,
     /// Subscribed to `MatchList` updates.
     pub listing: bool,
     pub udp_token: u64,
@@ -35,7 +35,7 @@ impl Session {
             addr,
             name: format!("Player{id}"),
             room: None,
-            modern: false,
+            greeted: false,
             listing: false,
             udp_token,
             outbound,
@@ -60,13 +60,10 @@ pub(crate) fn frame(packet: &Packet) -> Bytes {
 impl Clients {
     /// Queues an encoded frame. Never blocks: a client whose queue is full is
     /// too slow to keep up and gets dropped instead of stalling everyone.
-    pub fn send_frame(&mut self, to: ClientId, tag: Tag, frame: &Bytes) {
+    pub fn send_frame(&mut self, to: ClientId, frame: &Bytes) {
         let Some(session) = self.map.get(&to) else {
             return;
         };
-        if tag.is_v2() && !session.modern {
-            return;
-        }
         match session.outbound.try_send(frame.clone()) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => {
@@ -78,7 +75,7 @@ impl Clients {
     }
 
     pub fn send(&mut self, to: ClientId, packet: &Packet) {
-        self.send_frame(to, packet.tag(), &frame(packet));
+        self.send_frame(to, &frame(packet));
     }
 
     pub fn name(&self, id: ClientId) -> &str {

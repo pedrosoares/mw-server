@@ -45,16 +45,6 @@ pub struct Config {
     #[arg(long, env = "MW_KEEPALIVE_SECS", default_value_t = 15)]
     pub keepalive_secs: u64,
 
-    /// Accept the unauthenticated v1 UDP `JoinMatch { room_id }`. Anyone who
-    /// knows a room id can then listen to its voice; only enable it while old
-    /// clients that don't send `UdpJoin` are still in use.
-    #[arg(long, env = "MW_LEGACY_UDP_JOIN")]
-    pub legacy_udp_join: bool,
-
-    /// Legacy UDP peers that stay silent for this long are forgotten.
-    #[arg(long, env = "MW_UDP_PEER_TIMEOUT_SECS", default_value_t = 30)]
-    pub udp_peer_timeout_secs: u64,
-
     /// TCP frames a client may send per second (0 = unlimited). Faster clients
     /// are throttled: the server stops reading their socket for a while.
     #[arg(long, env = "MW_MAX_MSGS_PER_SEC", default_value_t = 1000)]
@@ -95,10 +85,6 @@ impl Config {
 
     pub(crate) fn keepalive(&self) -> Option<Duration> {
         (self.keepalive_secs > 0).then(|| Duration::from_secs(self.keepalive_secs))
-    }
-
-    pub(crate) fn udp_peer_timeout(&self) -> Duration {
-        Duration::from_secs(self.udp_peer_timeout_secs)
     }
 
     pub(crate) fn tick_interval(&self) -> Option<Duration> {

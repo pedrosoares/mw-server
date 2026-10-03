@@ -1,7 +1,7 @@
 # Wire protocol
 
 The source of truth is `crates/protocol/src/lib.rs`. The test
-`v1_wire_format_is_unchanged` pins the v1 bytes.
+`wire_format_is_unchanged` pins the bytes.
 
 ## TCP framing
 
@@ -33,38 +33,36 @@ The source of truth is `crates/protocol/src/lib.rs`. The test
 | 3 | `Login { id, name }` | S→C | Reply with the name the server actually stored. |
 | 4 | `ListMatches` | C→S | Subscribes to `MatchList` updates and sends the list now. |
 | 5 | `RemoveFromListMatches` | C→S | Unsubscribes. |
-| 6 | `MatchDeleted` | S→C | Your room was deleted, or a v1 client's `JoinMatch` failed. You are back in the lobby. |
+| 6 | `MatchDeleted` | S→C | The owner deleted your room or left. You are back in the lobby. |
 | 7 | `NewMatch { room_name }` | C→S | Creates a room you own. Stops `MatchList` updates. |
 | 8 | `DeleteMatch { room_id }` | C→S | Owner only. |
 | 9 | `MatchCreated { id, owner_id, room_name }` | S→C | |
 | 10 | `MatchJoined { id, user_id, user_name, room_name }` | S→C | The joiner gets one for every member, itself included, in join order. Existing members get one for the joiner. |
 | 11 | `MatchLeaved { user_id, user_name }` | S→C | A member left or disconnected. |
-| 12 | `JoinMatch { room_id }` | C→S | Lobby only. Over UDP it is the legacy join (see below). |
+| 12 | `JoinMatch { room_id }` | C→S | Lobby only. Refused with `Error` if the room is missing, full or already started. |
 | 13 | `LeaveMatch { room_id }` | C→S | When the owner sends it, it deletes the room. |
-| 14 | `MatchList { matches: [(id, name, players)] }` | S→C | Sent when a room is created, joined, left, started or deleted. |
+| 14 | `MatchList { matches: [(id, name, players)] }` | S→C | Rooms that can still be joined (not started). Sent when a room is created, joined, left, started or deleted. |
 | 15 | `StartMatch { room_id, map }` | C→S→C | Owner only. Relayed to the other members. |
 | 16 | `SpawnPlayers { room_id, positions }` | C→S | Owner only. Each member, in join order, gets `Spawn` with `positions[i % len]`. |
-| 17 | `SpawnRemoteObject {..}` | C→S→C | Relayed verbatim to the other members. |
-| 18 | `DespawnRemoteObject {..}` | C→S→C | Relayed verbatim. |
-| 19 | `RemoteObjectCall { id, .., broadcast }` | C→S→C | When `broadcast` is set, sent to the other members. Otherwise sent only to member `id` of the same room. |
-| 20 | `RemoteObjectLocation {..}` | C→S→C | Relayed verbatim. |
-| 21 | `Spawn { position }` | S→C (and relayed) | |
+| 17 | `SpawnRemoteObject { id, .. }` | C→S→C | Relayed verbatim to the other members. `id` must be the sender's. |
+| 18 | `DespawnRemoteObject { id, .. }` | C→S→C | Relayed verbatim. `id` must be the sender's. |
+| 19 | `RemoteObjectCall { id, .., broadcast }` | C→S→C | `id` is the owner of the object called. With `broadcast`, `id` must be the sender's and the call goes to the other members. Without it, the call goes only to member `id` of the same room. |
+| 20 | `RemoteObjectLocation { id, .. }` | C→S→C | Relayed verbatim. `id` must be the sender's. Prefer UDP (see below). |
+| 21 | `Spawn { position }` | S→C | Answer to `SpawnPlayers`. |
 | 22 | `Message { id, name, text }` | C→S→C | The server overwrites `id` and `name` with the sender's. |
-| 23 | `Hello { protocol_version }` | C→S | **v2.** Should be the first packet. Opts into v2. |
-| 24 | `Welcome { protocol_version, client_id, udp_token }` | S→C | **v2.** Reply to `Hello`. |
-| 25 | `Error { code, message }` | S→C | **v2.** A request was refused. `code`: 0 InvalidState, 1 RoomNotFound, 2 RoomFull, 3 NotOwner, 4 UnsupportedVersion, 5 Malformed. |
-| 26 | `Game { kind, payload }` | C→S→C | **v2.** Game-defined packet, routed by the server's `RoomLogic`. By default it is relayed to the other members. |
-| 27 | `UdpJoin { token }` | C→S (UDP) | **v2.** Binds this UDP address to your session. |
+| 23 | `Hello { protocol_version }` | C→S | Must be the first packet. Anything else first, or another version, closes the connection. |
+| 24 | `Welcome { protocol_version, client_id, udp_token }` | S→C | Reply to `Hello`. |
+| 25 | `Error { code, message }` | S→C | A request was refused. `code`: 0 InvalidState, 1 RoomNotFound, 2 RoomFull, 3 NotOwner, 4 UnsupportedVersion, 5 Malformed, 6 MatchStarted. |
+| 26 | `Game { kind, payload }` | C→S→C | Game-defined packet, routed by the server's `RoomLogic`. By default it is relayed to the other members. |
+| 27 | `UdpJoin { token }` | C→S (UDP) | Binds this UDP address to your session. |
 
-A client that never sends `Hello` is treated as v1 and **never receives a
-packet with tag 23 or higher**, so the original Godot client keeps working.
-Packets that are not valid in the client's current state are ignored. A v2
-client gets an `Error` for them instead.
+Packets that are not valid in the client's current state are refused with an
+`Error`, and the connection stays open.
 
 ## Session flow
 
 ```
-C: Hello{2}                 S: Welcome{2, client_id, udp_token}    (v2 only)
+C: Hello{2}                 S: Welcome{2, client_id, udp_token}
 C: LoginRequest{name}       S: Login{id, name}
 C: ListMatches              S: MatchList{..}  (+ updates)
 C: NewMatch{name}           S: MatchCreated{..}
@@ -87,17 +85,11 @@ receive `MatchDeleted`.
 2. After that, every datagram from that address is relayed to the UDP
    addresses of the other members of your current room. Room membership
    follows the TCP session: after `LeaveMatch` you stop sending and receiving.
-   - **v2 receivers** (joined with `UdpJoin`) get
-     `[sender client_id: i32 BE][datagram as sent]`. The server writes the
-     sender id, so it can't be spoofed. Senders that joined the legacy way
-     appear as `-1`.
-   - **v1 receivers** (legacy join) get the datagram exactly as sent.
-   - A relayed datagram is always at least 5 bytes, so the 1-byte `[0]`
-     acknowledgement can't be confused with one.
-3. A legacy `JoinMatch { room_id }` datagram is accepted only with
-   `--legacy-udp-join`. It lets anyone who knows a room id listen in, so turn it
-   off once every client sends `UdpJoin`.
-4. Each address may send at most `--udp-max-packets-per-sec` datagrams and
+   Receivers get `[sender client_id: i32 BE][datagram as sent]`. The server
+   writes the sender id, so it can't be spoofed. A relayed datagram is always
+   at least 5 bytes, so the 1-byte `[0]` acknowledgement can't be confused
+   with one.
+3. Each address may send at most `--udp-max-packets-per-sec` datagrams and
    `--udp-max-bytes-per-sec` bytes per second. Anything above that is dropped.
 
 ### Payload convention
