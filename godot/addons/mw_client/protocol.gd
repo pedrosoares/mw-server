@@ -42,6 +42,7 @@ const PACKETS := [
 	["Error", [["code", T.ENUM], ["message", T.STR]]],
 	["Game", [["kind", T.U16], ["payload", T.BYTES]]],
 	["UdpJoin", [["token", T.U64]]],
+	["OwnerChanged", [["room_id", T.I32], ["owner_id", T.I32]]],
 ]
 
 ## Error.code values.

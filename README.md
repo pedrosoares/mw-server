@@ -45,6 +45,8 @@ Every flag also reads an env var:
 | `--udp-max-packets-per-sec` | `MW_UDP_MAX_PACKETS_PER_SEC` | `500` | Excess datagrams are dropped. |
 | `--udp-max-bytes-per-sec` | `MW_UDP_MAX_BYTES_PER_SEC` | `524288` | Excess datagrams are dropped. |
 | `--tick-rate` | `MW_TICK_RATE` | `0` | `RoomLogic::on_tick` calls per second. |
+| `--late-join` | `MW_LATE_JOIN` | off | Started matches stay joinable; late joiners get `StartMatch` and every live object. |
+| `--host-migration` | `MW_HOST_MIGRATION` | off | When the owner leaves, the room passes to the next member (`OwnerChanged`) instead of closing. |
 
 ## Layout
 

@@ -139,6 +139,13 @@ pub enum Packet {
     UdpJoin {
         token: u64,
     },
+    /// Server -> room members: the owner left and `owner_id` (the earliest
+    /// remaining member) owns the room now. Only sent by servers running
+    /// with host migration.
+    OwnerChanged {
+        room_id: i32,
+        owner_id: i32,
+    },
 }
 
 /// Discriminant of a [`Packet`], equal to the varint postcard writes first.
@@ -173,10 +180,11 @@ pub enum Tag {
     Error,
     Game,
     UdpJoin,
+    OwnerChanged,
 }
 
 impl Tag {
-    const ALL: [Tag; 28] = [
+    const ALL: [Tag; 29] = [
         Tag::Ping,
         Tag::Disconnect,
         Tag::LoginRequest,
@@ -205,6 +213,7 @@ impl Tag {
         Tag::Error,
         Tag::Game,
         Tag::UdpJoin,
+        Tag::OwnerChanged,
     ];
 
     pub fn from_index(index: u32) -> Option<Tag> {
@@ -281,6 +290,7 @@ impl Packet {
             Packet::Error { .. } => Tag::Error,
             Packet::Game { .. } => Tag::Game,
             Packet::UdpJoin { .. } => Tag::UdpJoin,
+            Packet::OwnerChanged { .. } => Tag::OwnerChanged,
         }
     }
 
@@ -457,6 +467,10 @@ mod tests {
                 payload: vec![1, 2, 3],
             },
             Packet::UdpJoin { token: 42 },
+            Packet::OwnerChanged {
+                room_id: 1,
+                owner_id: 2,
+            },
         ]
     }
 

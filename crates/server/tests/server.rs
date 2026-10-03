@@ -445,6 +445,121 @@ fn started_matches_are_hidden_and_closed() {
 }
 
 #[test]
+fn late_join_replays_the_match() {
+    let server = start(|config| config.late_join = true);
+    let mut host = Client::player(&server, "host");
+    let room = host.create_room("r");
+    let object = |id: i32, object_id: i32, x: f32| Packet::SpawnRemoteObject {
+        id,
+        object_id,
+        position: (x, 0.0, 0.0),
+        rotation: (0.0, 1.0, 0.0),
+    };
+    host.send(&Packet::StartMatch {
+        room_id: room,
+        map: "yard".into(),
+    });
+    host.send(&object(host.id, 1, 1.0));
+    host.send(&object(host.id, 2, 2.0));
+    host.send(&Packet::RemoteObjectLocation {
+        id: host.id,
+        object_id: 1,
+        position: (5.0, 0.0, 0.0),
+        rotation: (0.0, 1.0, 0.0),
+    });
+    host.send(&Packet::DespawnRemoteObject {
+        id: host.id,
+        object_id: 2,
+    });
+    // Barrier: once this is answered, the server has seen the packets above.
+    host.send(&Packet::ListMatches);
+    assert!(matches!(host.recv(), Packet::Error { .. }));
+
+    // Started rooms stay listed and joinable.
+    let mut late = Client::player(&server, "late");
+    late.send(&Packet::ListMatches);
+    late.expect(Packet::MatchList {
+        matches: vec![(room, "r".into(), 1)],
+    });
+    late.join_room(room, 1);
+    late.expect(Packet::StartMatch {
+        room_id: room,
+        map: "yard".into(),
+    });
+    // Only the live object, at its latest position.
+    late.expect(object(host.id, 1, 5.0));
+    late.assert_silent();
+    host.expect(joined(room, &late, "late", "r"));
+
+    // A leaver's objects are forgotten.
+    late.send(&object(late.id, 1, 9.0));
+    host.recv();
+    drop(late);
+    assert!(matches!(host.recv(), Packet::MatchLeaved { .. }));
+    let mut third = Client::player(&server, "third");
+    third.join_room(room, 1);
+    third.recv(); // StartMatch
+    third.expect(object(host.id, 1, 5.0));
+    third.assert_silent();
+}
+
+#[test]
+fn host_migration_hands_the_room_over() {
+    let server = start(|config| config.host_migration = true);
+    let mut host = Client::player(&server, "host");
+    let room = host.create_room("r");
+    let mut second = Client::player(&server, "second");
+    second.join_room(room, 1);
+    host.recv();
+    let mut third = Client::player(&server, "third");
+    third.join_room(room, 2);
+    host.recv();
+    second.recv();
+
+    // The owner leaves: the earliest remaining member takes over.
+    host.send(&Packet::LeaveMatch { room_id: room });
+    let new_owner = second.id;
+    for client in [&mut second, &mut third] {
+        assert!(matches!(client.recv(), Packet::MatchLeaved { user_id, .. } if user_id == host.id));
+        client.expect(Packet::OwnerChanged {
+            room_id: room,
+            owner_id: new_owner,
+        });
+    }
+    // The new owner has the owner's rights, the others still don't.
+    third.send(&Packet::StartMatch {
+        room_id: room,
+        map: "m".into(),
+    });
+    assert!(matches!(
+        third.recv(),
+        Packet::Error {
+            code: ErrorCode::NotOwner,
+            ..
+        }
+    ));
+    second.send(&Packet::StartMatch {
+        room_id: room,
+        map: "m".into(),
+    });
+    third.expect(Packet::StartMatch {
+        room_id: room,
+        map: "m".into(),
+    });
+
+    // Disconnecting migrates too; the last one out closes the room.
+    drop(second);
+    assert!(matches!(third.recv(), Packet::MatchLeaved { .. }));
+    third.expect(Packet::OwnerChanged {
+        room_id: room,
+        owner_id: third.id,
+    });
+    third.send(&Packet::LeaveMatch { room_id: room });
+    third.send(&Packet::ListMatches);
+    third.expect(Packet::MatchList { matches: vec![] });
+}
+
+#[test]
 fn players_cannot_act_for_others() {
     let server = start(|_| {});
     let mut host = Client::player(&server, "host");

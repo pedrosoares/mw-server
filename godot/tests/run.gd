@@ -59,6 +59,7 @@ func _test_codec() -> void:
 			[0, 0, 0, 13, 24, 2, 14, 255, 255, 255, 255, 255, 255, 255, 255, 255, 1]],
 		[{"type": "Game", "kind": 300, "payload": PackedByteArray([1, 2, 3])},
 			[0, 0, 0, 7, 26, 172, 2, 3, 1, 2, 3]],
+		[{"type": "OwnerChanged", "room_id": 1, "owner_id": 2}, [0, 0, 0, 3, 28, 2, 4]],
 	]
 	for c in cases:
 		var expected := PackedByteArray(c[1])

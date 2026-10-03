@@ -22,6 +22,9 @@ signal match_created(room_id: int, owner_id: int, room_name: String)
 signal match_joined(room_id: int, user_id: int, user_name: String, room_name: String)
 signal match_left(user_id: int, user_name: String)
 signal match_deleted
+## The room's owner left and `owner_id` owns it now (servers running with
+## --host-migration).
+signal owner_changed(owner_id: int)
 signal server_error(code: int, message: String)
 signal udp_ready
 signal location_received(sender: int, object_id: int, position: Vector3, rotation: Vector3)
@@ -214,6 +217,8 @@ func _handle(packet: Dictionary) -> void:
 			room_id = -1
 			_latest.clear()
 			match_deleted.emit()
+		"OwnerChanged":
+			owner_changed.emit(packet.owner_id)
 		"Error":
 			server_error.emit(packet.code, packet.message)
 		"Disconnect":

@@ -62,6 +62,16 @@ pub struct Config {
     #[arg(long, env = "MW_UDP_MAX_BYTES_PER_SEC", default_value_t = 512 * 1024)]
     pub udp_max_bytes_per_sec: u32,
 
+    /// Let players join matches that already started: started rooms stay
+    /// listed, and late joiners get `StartMatch` plus every live object.
+    #[arg(long, env = "MW_LATE_JOIN")]
+    pub late_join: bool,
+
+    /// When the room owner leaves, hand the room to the earliest remaining
+    /// member (`OwnerChanged`) instead of deleting it.
+    #[arg(long, env = "MW_HOST_MIGRATION")]
+    pub host_migration: bool,
+
     /// Calls `RoomLogic::on_tick` for started rooms this many times per second
     /// (0 = disabled).
     #[arg(long, env = "MW_TICK_RATE", default_value_t = 0)]

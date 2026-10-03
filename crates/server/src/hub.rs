@@ -46,6 +46,11 @@ struct Room {
     /// Join order; the owner is always first.
     members: Vec<ClientId>,
     started: bool,
+    /// The map from `StartMatch`, replayed to late joiners.
+    map: String,
+    /// Live objects (owner, object id) -> last position and rotation sent
+    /// over TCP, replayed to late joiners.
+    objects: BTreeMap<(ClientId, i32), (Vec3, Vec3)>,
     logic: Box<dyn RoomLogic>,
 }
 
@@ -153,6 +158,9 @@ impl Hub {
         };
         trace!(client = %id, ?packet, "packet");
         let tag = packet.tag();
+        if let Some(room) = room {
+            self.track_object(room, id, &packet);
+        }
 
         if !greeted && tag != Tag::Hello {
             self.reject(
@@ -189,11 +197,7 @@ impl Hub {
             // ---- room management ----
             (Packet::LeaveMatch { room_id }, Some(room)) => {
                 if self.check_room(id, room, room_id, false) {
-                    if self.rooms.get(&room).is_some_and(|r| r.owner == id) {
-                        self.delete_room(room);
-                    } else {
-                        self.leave_room(id);
-                    }
+                    self.leave_or_close(id, room);
                 }
             }
             (Packet::DeleteMatch { room_id }, Some(room)) => {
@@ -320,6 +324,8 @@ impl Hub {
                 owner,
                 members: vec![owner],
                 started: false,
+                map: String::new(),
+                objects: BTreeMap::new(),
                 logic: (self.logic)(room_id),
             },
         );
@@ -343,9 +349,9 @@ impl Hub {
             return;
         };
         let room = &self.rooms[&room_id];
-        // Late joiners would never get StartMatch/Spawn nor the objects
-        // spawned so far, so started matches are closed.
-        if room.started {
+        // Without late join, started matches are closed: the game would have
+        // to catch the newcomer up on its own.
+        if room.started && !self.config.late_join {
             self.reject(id, ErrorCode::MatchStarted, "match already started");
             return;
         }
@@ -380,6 +386,25 @@ impl Hub {
                 self.clients.send_frame(member, &joined);
             }
         }
+        if room.started {
+            // Late join: the match and everything alive in it.
+            self.clients.send(
+                id,
+                &Packet::StartMatch {
+                    room_id: room_id.wire(),
+                    map: room.map.clone(),
+                },
+            );
+            for (&(owner, object_id), &(position, rotation)) in &room.objects {
+                let spawn = Packet::SpawnRemoteObject {
+                    id: owner.wire(),
+                    object_id,
+                    position,
+                    rotation,
+                };
+                self.clients.send(id, &spawn);
+            }
+        }
         self.with_logic(room_id, |logic, ctx| logic.on_join(ctx, id));
         self.broadcast_match_list();
     }
@@ -393,6 +418,7 @@ impl Hub {
             return;
         };
         room.members.retain(|&member| member != id);
+        room.objects.retain(|&(owner, _), _| owner != id);
         info!(room = %room_id, client = %id, "left room");
 
         let left = frame(&Packet::MatchLeaved {
@@ -404,6 +430,66 @@ impl Hub {
         }
         self.with_logic(room_id, |logic, ctx| logic.on_leave(ctx, id));
         self.broadcast_match_list();
+    }
+
+    /// `id` leaves `room_id`. When it owned the room, the room is handed to
+    /// the earliest remaining member (host migration) or deleted.
+    fn leave_or_close(&mut self, id: ClientId, room_id: RoomId) {
+        let Some(room) = self.rooms.get(&room_id) else {
+            return;
+        };
+        if room.owner != id {
+            self.leave_room(id);
+            return;
+        }
+        if !self.config.host_migration || room.members.len() < 2 {
+            self.delete_room(room_id);
+            return;
+        }
+        self.leave_room(id);
+        let Some(room) = self.rooms.get_mut(&room_id) else {
+            return;
+        };
+        room.owner = room.members[0];
+        info!(room = %room_id, owner = %room.owner, "host migrated");
+        let changed = frame(&Packet::OwnerChanged {
+            room_id: room_id.wire(),
+            owner_id: room.owner.wire(),
+        });
+        for &member in &room.members {
+            self.clients.send_frame(member, &changed);
+        }
+    }
+
+    /// Keeps each room's live objects up to date for late joiners. Only the
+    /// object's owner may change it (the relay enforces the same rule).
+    fn track_object(&mut self, room_id: RoomId, from: ClientId, packet: &Packet) {
+        if !self.config.late_join {
+            return;
+        }
+        let Some(room) = self.rooms.get_mut(&room_id) else {
+            return;
+        };
+        match *packet {
+            Packet::SpawnRemoteObject {
+                id,
+                object_id,
+                position,
+                rotation,
+            }
+            | Packet::RemoteObjectLocation {
+                id,
+                object_id,
+                position,
+                rotation,
+            } if id == from.wire() => {
+                room.objects.insert((from, object_id), (position, rotation));
+            }
+            Packet::DespawnRemoteObject { id, object_id } if id == from.wire() => {
+                room.objects.remove(&(from, object_id));
+            }
+            _ => {}
+        }
     }
 
     fn delete_room(&mut self, room_id: RoomId) {
@@ -424,6 +510,7 @@ impl Hub {
     fn start(&mut self, owner: ClientId, room_id: RoomId, map: &str, frame: &Bytes) {
         if let Some(room) = self.rooms.get_mut(&room_id) {
             room.started = true;
+            room.map = map.to_owned();
         }
         info!(room = %room_id, map, "match started");
         self.relay(owner, room_id, Route::Others, frame);
@@ -498,7 +585,7 @@ impl Hub {
             matches: self
                 .rooms
                 .values()
-                .filter(|room| !room.started)
+                .filter(|room| !room.started || self.config.late_join)
                 .map(|room| (room.id.wire(), room.name.clone(), room.members.len() as i32))
                 .collect(),
         }
@@ -526,11 +613,7 @@ impl Hub {
             return;
         };
         if let Some(room) = session.room {
-            if self.rooms.get(&room).is_some_and(|r| r.owner == id) {
-                self.delete_room(room);
-            } else {
-                self.leave_room(id);
-            }
+            self.leave_or_close(id, room);
         }
         if let Some(session) = self.clients.map.remove(&id) {
             info!(client = %id, addr = %session.addr, reason, "disconnected");

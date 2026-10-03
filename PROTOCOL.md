@@ -33,15 +33,15 @@ The source of truth is `crates/protocol/src/lib.rs`. The test
 | 3 | `Login { id, name }` | S→C | Reply with the name the server actually stored. |
 | 4 | `ListMatches` | C→S | Subscribes to `MatchList` updates and sends the list now. |
 | 5 | `RemoveFromListMatches` | C→S | Unsubscribes. |
-| 6 | `MatchDeleted` | S→C | The owner deleted your room or left. You are back in the lobby. |
+| 6 | `MatchDeleted` | S→C | The owner deleted your room, or left without host migration. You are back in the lobby. |
 | 7 | `NewMatch { room_name }` | C→S | Creates a room you own. Stops `MatchList` updates. |
 | 8 | `DeleteMatch { room_id }` | C→S | Owner only. |
 | 9 | `MatchCreated { id, owner_id, room_name }` | S→C | |
 | 10 | `MatchJoined { id, user_id, user_name, room_name }` | S→C | The joiner gets one for every member, itself included, in join order. Existing members get one for the joiner. |
 | 11 | `MatchLeaved { user_id, user_name }` | S→C | A member left or disconnected. |
-| 12 | `JoinMatch { room_id }` | C→S | Lobby only. Refused with `Error` if the room is missing, full or already started. |
-| 13 | `LeaveMatch { room_id }` | C→S | When the owner sends it, it deletes the room. |
-| 14 | `MatchList { matches: [(id, name, players)] }` | S→C | Rooms that can still be joined (not started). Sent when a room is created, joined, left, started or deleted. |
+| 12 | `JoinMatch { room_id }` | C→S | Lobby only. Refused with `Error` if the room is missing or full, or already started (unless the server runs with `--late-join`, see below). |
+| 13 | `LeaveMatch { room_id }` | C→S | When the owner sends it, it deletes the room, or hands it over with `--host-migration`. |
+| 14 | `MatchList { matches: [(id, name, players)] }` | S→C | Rooms that can be joined: not started, or all of them with `--late-join`. Sent when a room is created, joined, left, started or deleted. |
 | 15 | `StartMatch { room_id, map }` | C→S→C | Owner only. Relayed to the other members. |
 | 16 | `SpawnPlayers { room_id, positions }` | C→S | Owner only. Each member, in join order, gets `Spawn` with `positions[i % len]`. |
 | 17 | `SpawnRemoteObject { id, .. }` | C→S→C | Relayed verbatim to the other members. `id` must be the sender's. |
@@ -55,6 +55,7 @@ The source of truth is `crates/protocol/src/lib.rs`. The test
 | 25 | `Error { code, message }` | S→C | A request was refused. `code`: 0 InvalidState, 1 RoomNotFound, 2 RoomFull, 3 NotOwner, 4 UnsupportedVersion, 5 Malformed, 6 MatchStarted. |
 | 26 | `Game { kind, payload }` | C→S→C | Game-defined packet, routed by the server's `RoomLogic`. By default it is relayed to the other members. |
 | 27 | `UdpJoin { token }` | C→S (UDP) | Binds this UDP address to your session. |
+| 28 | `OwnerChanged { room_id, owner_id }` | S→C | With `--host-migration`: the owner left, and `owner_id` (the earliest remaining member) owns the room now. |
 
 Packets that are not valid in the client's current state are refused with an
 `Error`, and the connection stays open.
@@ -73,7 +74,26 @@ C: LeaveMatch{room}         others: MatchLeaved{..}
 ```
 
 When the owner leaves or disconnects, the room is deleted and the other members
-receive `MatchDeleted`.
+receive `MatchDeleted`, unless the server runs with `--host-migration` (see
+below).
+
+### Late join (`--late-join`)
+
+Started rooms stay listed and joinable. After the usual `MatchJoined` list,
+a late joiner gets the room's `StartMatch { room_id, map }` and then a
+`SpawnRemoteObject` for every live object, at the last position sent over
+TCP (spawn or `RemoteObjectLocation`). Positions sent over UDP aren't
+tracked, but they arrive within a tick anyway. Game state that isn't an
+object (scores, teams) is the game's job: have a member, typically the
+owner, send it when it sees the `MatchJoined`.
+
+### Host migration (`--host-migration`)
+
+When the owner leaves or disconnects and other members remain, they get
+`MatchLeaved` for the owner, then `OwnerChanged` naming the new owner (the
+earliest remaining member), instead of `MatchDeleted`. The last member out
+closes the room. Clients that don't know tag 28 must not connect to a
+server running with this flag.
 
 ## UDP
 
