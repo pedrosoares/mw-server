@@ -355,6 +355,10 @@ impl Hub {
             self.reject(id, ErrorCode::MatchStarted, "match already started");
             return;
         }
+        if !room.logic.joinable() {
+            self.reject(id, ErrorCode::MatchStarted, "match is over");
+            return;
+        }
         let max = self.config.max_room_players;
         if max > 0 && room.members.len() >= max {
             self.reject(id, ErrorCode::RoomFull, "room is full");
@@ -585,7 +589,7 @@ impl Hub {
             matches: self
                 .rooms
                 .values()
-                .filter(|room| !room.started || self.config.late_join)
+                .filter(|room| (!room.started || self.config.late_join) && room.logic.joinable())
                 .map(|room| (room.id.wire(), room.name.clone(), room.members.len() as i32))
                 .collect(),
         }
@@ -647,6 +651,7 @@ impl Hub {
         let Some(room) = self.rooms.get_mut(&room_id) else {
             return;
         };
+        let joinable = room.logic.joinable();
         let mut ctx = RoomCtx {
             room: room.id,
             owner: room.owner,
@@ -655,6 +660,9 @@ impl Hub {
             clients: &mut self.clients,
         };
         f(room.logic.as_mut(), &mut ctx);
+        if room.logic.joinable() != joinable {
+            self.broadcast_match_list();
+        }
     }
 
     /// Logs a refused request and tells the client why.

@@ -28,6 +28,13 @@ pub enum Route {
 }
 
 pub trait RoomLogic: Send + 'static {
+    /// Whether players may join the room now. While false the room is
+    /// hidden from `MatchList` and joins are refused (e.g. a match that is
+    /// over). The lobby re-checks it after every hook.
+    fn joinable(&self) -> bool {
+        true
+    }
+
     /// `client` was added to the room (the owner too, right after creation).
     fn on_join(&mut self, _ctx: &mut RoomCtx<'_>, _client: ClientId) {}
 

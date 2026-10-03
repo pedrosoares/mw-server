@@ -125,6 +125,8 @@ server.run(async { tokio::signal::ctrl_c().await.ok(); }).await?;
 
 Hooks: `on_join`, `on_leave`, `on_start`, `on_tick`, `on_game_packet`. They
 run on the hub task, so keep them short. Send heavy work to another task.
+`joinable()` closes the room: while it returns false the room is hidden from
+`MatchList` and joins are refused (for example once a match is over).
 
 ## Development
 

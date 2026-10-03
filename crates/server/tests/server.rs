@@ -559,6 +559,59 @@ fn host_migration_hands_the_room_over() {
     third.expect(Packet::MatchList { matches: vec![] });
 }
 
+/// Closes the room to newcomers once a `Game` packet of kind 9 arrives.
+#[derive(Default)]
+struct ClosingLogic {
+    over: bool,
+}
+
+impl RoomLogic for ClosingLogic {
+    fn joinable(&self) -> bool {
+        !self.over
+    }
+
+    fn on_game_packet(
+        &mut self,
+        _ctx: &mut RoomCtx<'_>,
+        _from: ClientId,
+        kind: u16,
+        _payload: &[u8],
+    ) -> Route {
+        self.over |= kind == 9;
+        Route::Drop
+    }
+}
+
+#[test]
+fn room_logic_can_close_a_room() {
+    let server = start_with(
+        |_| {},
+        |config| Server::new(config).with_room_logic(|_| Box::new(ClosingLogic::default())),
+    );
+    let mut host = Client::player(&server, "host");
+    let room = host.create_room("r");
+    let mut watcher = Client::player(&server, "watcher");
+    watcher.send(&Packet::ListMatches);
+    watcher.expect(Packet::MatchList {
+        matches: vec![(room, "r".into(), 1)],
+    });
+
+    host.send(&Packet::Game {
+        kind: 9,
+        payload: vec![],
+    });
+    // Hidden as soon as the logic says so, and closed to joins.
+    watcher.expect(Packet::MatchList { matches: vec![] });
+    watcher.send(&Packet::JoinMatch { room_id: room });
+    assert!(matches!(
+        watcher.recv(),
+        Packet::Error {
+            code: ErrorCode::MatchStarted,
+            ..
+        }
+    ));
+}
+
 #[test]
 fn players_cannot_act_for_others() {
     let server = start(|_| {});
